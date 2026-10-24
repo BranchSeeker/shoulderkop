@@ -1,7 +1,8 @@
 #!/bin/sh
 # shoulderkop-install.sh — ставит shoulderkop вместе с podkop и sing-box-extended.
 #
-# Всё необходимое ставится само. При первом запуске спрашиваем:
+# Всё необходимое ставится само (curl — всегда первым делом, остальные
+# пакеты потом). При первом запуске спрашиваем:
 #   1) ставить ли sing-box-extended (нужен для xhttp-узлов);
 #   2) ссылку на подписку (можно пропустить и добавить позже в LuCI).
 # При повторном запуске добавляются вопросы про обновление: если установленная
@@ -497,19 +498,8 @@ preflight() {
 		*) die "не найден ни apk, ни opkg" ;;
 	esac
 
-	DLTOOL=""
-	# uclient-fetch раньше wget: на OpenWrt wget — busybox без -T/-t/-U и без
-	# проверки сертификатов в некоторых сборках
-	if have curl; then
-		DLTOOL="curl"
-	elif have uclient-fetch; then
-		DLTOOL="uclient-fetch"
-	elif have wget; then
-		DLTOOL="wget"
-	else
-		die "нет curl, uclient-fetch или wget — нечем скачивать пакеты"
-	fi
-	ok "чем качать: $DLTOOL"
+	DLTOOL="curl"
+	ensure_curl || die "без curl установка невозможна: поставьте его вручную (apk add curl / opkg install curl)"
 
 	have uci || die "нет uci — это точно OpenWrt?"
 
@@ -613,6 +603,48 @@ pkg_install_name() {
 		opkg) opkg install "$1" >>"$LOG" 2>&1 ;;
 		*) return 1 ;;
 	esac
+}
+
+# curl обязателен для всех загрузок: busybox-wget на чистом OpenWrt не понимает
+# -T/-t/-U и молча падает, uclient-fetch умеет не всё (и умеет зависать на
+# редиректах релизов). Поэтому ставим curl до первой сетевой операции.
+ensure_curl() {
+	if have curl; then
+		ok "чем качать: curl"
+		return 0
+	fi
+
+	info "curl не установлен — ставлю его первым делом"
+
+	if [ "$DRY" -eq 1 ]; then
+		warn "dry-run: поставил бы curl (ca-bundle + curl)"
+		return 0
+	fi
+
+	# ca-bundle нужен curl для HTTPS; на минимальных сборках его нет
+	if ! pkg_installed ca-bundle; then
+		pkg_install_name ca-bundle >/dev/null 2>&1 && ok "ca-bundle установлен"
+	fi
+
+	_try=0
+	while [ "$_try" -lt 3 ]; do
+		_try=$((_try + 1))
+		pkg_update
+		if pkg_install_name curl && have curl; then
+			ok "curl установлен"
+			return 0
+		fi
+		# apk/opkg может держать блокировку базы после прерванной установки
+		if tail -n 20 "$LOG" 2>/dev/null | grep -q 'Unable to lock database'; then
+			warn "пакетный менеджер занят другим процессом — жду и пробую ещё"
+			sleep 3
+			continue
+		fi
+		break
+	done
+
+	warn "не удалось поставить curl из репозитория"
+	return 1
 }
 
 pkg_remove() {
