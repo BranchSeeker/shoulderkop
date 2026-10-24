@@ -63,7 +63,7 @@ podkop, sing-box-extended, shoulderkop — и сам применяет подп
 
 ```sh
 # скачать и запустить — спросит только про extended и подписку
-wget -O /tmp/sk-install.sh https://raw.githubusercontent.com/BranchSeeker/shoulderkop/main/installer/shoulderkop-install.sh
+wget -O /tmp/sk-install.sh https://github.com/BranchSeeker/shoulderkop/releases/latest/download/shoulderkop-install.sh
 sh /tmp/sk-install.sh
 
 # совсем без вопросов: extended + подписка + режим

@@ -50,14 +50,18 @@ make package/luci-app-shoulderkop/compile V=s -j2
 
 ## Релиз
 
-Собирается из артефактов обеих матриц и содержит пять файлов: `shoulderkop-*.apk`,
+Собирается из артефактов обеих матриц и содержит шесть файлов: `shoulderkop-*.apk`,
 `luci-app-shoulderkop-*.apk`, `shoulderkop_*_all.ipk`, `luci-app-shoulderkop_*_all.ipk`
-и `SHA256SUMS`.
+`SHA256SUMS` и `shoulderkop-install.sh`.
 
-Установщик `installer/shoulderkop-install.sh` в релиз **не попадает**: он живёт в репозитории
-и всегда скачивается по одной и той же ссылке (ветка `main`):
+Установщик `installer/shoulderkop-install.sh` публикуется в каждом релизе, поэтому работают
+обе ссылки:
 
 ```sh
+# короткая, всегда последний релиз
+wget -O /tmp/sk-install.sh https://github.com/BranchSeeker/shoulderkop/releases/latest/download/shoulderkop-install.sh
+
+# постоянная, всегда текущий main (без привязки к релизу)
 wget -O /tmp/sk-install.sh https://raw.githubusercontent.com/BranchSeeker/shoulderkop/main/installer/shoulderkop-install.sh
 ```
 

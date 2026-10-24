@@ -183,7 +183,10 @@ jobs:
           # в релизе ровно 4 пакета: apk и ipk, каждый по 2 штуки
           test "$(ls -1 out/*.apk | wc -l)" -eq 2
           test "$(ls -1 out/*.ipk | wc -l)" -eq 2
-          (cd out && sha256sum *.apk *.ipk > SHA256SUMS)
+          # установщик кладём в релиз: короткая ссылка
+          # releases/latest/download/shoulderkop-install.sh должна работать
+          cp installer/shoulderkop-install.sh out/
+          (cd out && sha256sum *.apk *.ipk shoulderkop-install.sh > SHA256SUMS)
           cat out/SHA256SUMS
 
       - uses: softprops/action-gh-release@v2
@@ -192,5 +195,6 @@ jobs:
             out/*.apk
             out/*.ipk
             out/SHA256SUMS
+            out/shoulderkop-install.sh
           generate_release_notes: true
           fail_on_unmatched_files: true
