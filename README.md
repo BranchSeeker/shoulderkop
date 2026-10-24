@@ -32,6 +32,19 @@ Xray JSON / список vless://
 Серверы внутри секции объединяются в `urltest`-группу: podkop сам переключается на лучший,
 интервал проверки по умолчанию — 30 секунд.
 
+## Установка
+
+Нужен OpenWrt 24.10+ (`apk` или `opkg`). Установщик сам ставит podkop, sing-box-extended и
+shoulderkop и спрашивает только два раза: ставить ли extended и ссылку на подписку.
+
+```sh
+sh(wget -O - https://github.com/BranchSeeker/shoulderkop/releases/latest/download/shoulderkop-install.sh)
+```
+
+Флаги и разбор ошибок — [installer/README.md](installer/README.md). Готовые пакеты —
+в [релизах](https://github.com/BranchSeeker/shoulderkop/releases), сборка — в
+[PACKAGING.md](PACKAGING.md).
+
 ### Списки сообщества (WiFi)
 
 В режиме «Домашний интернет» списки podkop (`community_lists`) редактируются в LuCI —
@@ -42,7 +55,7 @@ Porn, News, Anime, HDRezka, Tik-Tok и другие.
 
 Пока списки не меняли, действуют прежние значения по умолчанию: `youtube` для `skop_yt`
 и `russia_inside, telegram, meta, cloudflare, hodca, roblox` для `skop_eu`. В режиме
-«Обход БС» списки сообщества не используются — там свои `.srs` РКН.
+«Обход БС» списки сообщества не используются — там свои `.srs` Белые списки РКН.
 
 ## Если подписка истекла
 
@@ -104,45 +117,6 @@ shoulderkop:
 поэтому однократная пересборка срабатывает и после перезагрузки роутера. При обновлении
 со старой версии счётчика ещё нет: если в этот момент одна из ссылок уже истекла, один
 раз нажмите «Обновить конфигурацию».
-
-## Диагностика сети
-
-В пакет встроена самопроверка: раз в 5 минут `shoulderkop diag` дергает
-`https://www.gstatic.com/generate_204`. Если интернет отвечает — на этом всё, в журнал ничего
-не пишется. Если нет — включается починка:
-
-1. возвращается автозапуск podkop, если его сняли;
-2. podkop перезапускается (лимит 3 раза за 30 минут), если sing-box или nft-таблица мертвы;
-3. спуск по DNS-лестнице до первой отвечающей ступени (только IP, чтобы не зависеть
-   от резолва): `8.8.8.8` DoT → `1.1.1.1` DoH → `1.1.1.1` DoT → `77.88.8.8` DoT →
-   `77.88.8.8` UDP;
-4. если интернета нет совсем — podkop останавливается и весь трафик идёт напрямую (direct),
-   чтобы LAN не остался без сети; после успешного обновления подписки туннель возвращается.
-
-Управление — в LuCI (блок «Диагностика»: статус, список проверок, кнопка «Проверить сейчас»)
-или руками: `shoulderkop diag`, `shoulderkop diag --json`, `shoulderkop diag --quick`.
-Журнал: `logread -e shoulderkop-diag`. Подробности и правила — в
-[docs/NETWORK-DIAGNOSTICS.md](docs/NETWORK-DIAGNOSTICS.md).
-
-## Установка
-
-Нужен OpenWrt 24.10+ (`apk` или `opkg`). Установщик сам ставит podkop, sing-box-extended и
-shoulderkop и спрашивает только два раза: ставить ли extended и ссылку на подписку.
-
-```sh
-wget -O /tmp/sk-install.sh https://raw.githubusercontent.com/BranchSeeker/shoulderkop/main/installer/shoulderkop-install.sh
-sh /tmp/sk-install.sh
-```
-
-Без вопросов:
-
-```sh
-sh /tmp/sk-install.sh --yes --url="https://panel.example.com/sub/TOKEN"
-```
-
-Флаги и разбор ошибок — [installer/README.md](installer/README.md). Готовые пакеты —
-в [релизах](https://github.com/BranchSeeker/shoulderkop/releases), сборка — в
-[PACKAGING.md](PACKAGING.md).
 
 ## Использование
 
