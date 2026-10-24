@@ -218,12 +218,14 @@ ask_url() {
 
 fetch() {
 	_fetch_url="$1"
+	# Порядок важен: на чистом OpenWrt wget — это busybox, он не понимает
+	# -T/-t/-U/--no-check-certificate и молча падает. uclient-fetch есть всегда.
 	if have curl; then
 		curl -fsSL --connect-timeout 10 --max-time 30 -A "$UA" "$_fetch_url" 2>/dev/null
-	elif have wget; then
-		wget -q -T 15 -t 1 -U "$UA" -O - "$_fetch_url" 2>/dev/null
 	elif have uclient-fetch; then
-		uclient-fetch -q -O - "$_fetch_url" 2>/dev/null
+		uclient-fetch -q -T 20 -U "$UA" -O - "$_fetch_url" 2>/dev/null
+	elif have wget; then
+		wget -q -O - "$_fetch_url" 2>/dev/null
 	else
 		return 1
 	fi
@@ -238,11 +240,11 @@ dl() {
 		if have curl; then
 			curl -fL --connect-timeout 15 --max-time 600 --retry 1 -A "$UA" -o "$_dl_file" "$_dl_src" 2>/dev/null \
 				&& [ -s "$_dl_file" ] && return 0
-		elif have wget; then
-			wget -q -T 120 -t 1 -U "$UA" -O "$_dl_file" "$_dl_src" 2>/dev/null \
+		elif have uclient-fetch; then
+			uclient-fetch -q -T 120 -U "$UA" -O "$_dl_file" "$_dl_src" 2>/dev/null \
 				&& [ -s "$_dl_file" ] && return 0
 		else
-			uclient-fetch -q -O "$_dl_file" "$_dl_src" 2>/dev/null \
+			wget -q -O "$_dl_file" "$_dl_src" 2>/dev/null \
 				&& [ -s "$_dl_file" ] && return 0
 		fi
 	done
@@ -496,14 +498,16 @@ preflight() {
 	esac
 
 	DLTOOL=""
+	# uclient-fetch раньше wget: на OpenWrt wget — busybox без -T/-t/-U и без
+	# проверки сертификатов в некоторых сборках
 	if have curl; then
 		DLTOOL="curl"
-	elif have wget; then
-		DLTOOL="wget"
 	elif have uclient-fetch; then
 		DLTOOL="uclient-fetch"
+	elif have wget; then
+		DLTOOL="wget"
 	else
-		die "нет curl, wget или uclient-fetch — нечем скачивать пакеты"
+		die "нет curl, uclient-fetch или wget — нечем скачивать пакеты"
 	fi
 	ok "чем качать: $DLTOOL"
 
