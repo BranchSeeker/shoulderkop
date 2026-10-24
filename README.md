@@ -38,7 +38,12 @@ Xray JSON / список vless://
 shoulderkop и спрашивает только два раза: ставить ли extended и ссылку на подписку.
 
 ```sh
-sh(wget -O - https://github.com/BranchSeeker/shoulderkop/releases/latest/download/shoulderkop-install.sh)
+wget -O - https://github.com/BranchSeeker/shoulderkop/releases/latest/download/shoulderkop-install.sh | sh
+```
+
+```sh
+wget -O /tmp/shoulderkop-install.sh https://github.com/BranchSeeker/shoulderkop/releases/latest/download/shoulderkop-install.sh
+sh /tmp/shoulderkop-install.sh
 ```
 
 Флаги и разбор ошибок — [installer/README.md](installer/README.md). Готовые пакеты —
