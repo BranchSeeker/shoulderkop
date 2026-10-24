@@ -28,16 +28,20 @@ const GSTATIC = "https://www.gstatic.com/generate_204";
 const PODKOP = "/etc/init.d/podkop";
 const SINGBOX = "/etc/init.d/sing-box";
 
-// DNS-лестница: от лучшего варианта к худшему (тип + сервер в терминах podkop).
-// Для DoH нужен hostname (sing-box проверяет сертификат), для DoT и UDP — тоже
-// hostname/IP, которые podkop сам подставит в dig/sing-box.
+// DNS-лестница: от лучшего варианта к худшему, только IP — чтобы проверка и
+// работа DNS не зависели от того, резолвится ли чьё-то имя (когда DNS и сломан,
+// резолвить нечем). Проверено на живом роутере: сертификаты 8.8.8.8, 1.1.1.1 и
+// 77.88.8.8 содержат IP-SAN, поэтому DoT по IP проходит проверку TLS.
+//
+// Почему здесь нет Google DoH: https://8.8.8.8/dns-query отдаёт 400 (Google
+// требует SNI/Host dns.google, а podkop умеет задать только адрес), а
+// https://77.88.8.8/dns-query — 404 (у Яндекса DoH по IP не поднят).
+// Поэтому DoH в лестнице один — Cloudflare, он по IP работает.
 const LADDER = [
-	{ type: "doh", server: "dns.google" },
-	{ type: "dot", server: "dns.google" },
-	{ type: "doh", server: "cloudflare-dns.com" },
-	{ type: "dot", server: "one.one.one.one" },
-	{ type: "doh", server: "common.dot.dns.yandex.net" },
-	{ type: "dot", server: "common.dot.dns.yandex.net" },
+	{ type: "dot", server: "8.8.8.8" },
+	{ type: "doh", server: "1.1.1.1" },
+	{ type: "dot", server: "1.1.1.1" },
+	{ type: "dot", server: "77.88.8.8" },
 	{ type: "udp", server: "77.88.8.8" }
 ];
 
@@ -169,9 +173,10 @@ function probe_level(i) {
 		return (code == "200");
 	}
 
+	// сертификаты этих IP содержат IP-SAN, отдельный tls-hostname не нужен
 	if (e.type == "dot")
 		return trim(sh("dig @" + e.server + " google.com +tls +timeout=3 +tries=1 " +
-			"+tls-hostname=" + e.server + " >/dev/null 2>&1 && echo ok")) == "ok";
+			">/dev/null 2>&1 && echo ok")) == "ok";
 
 	return trim(sh("dig @" + e.server + " google.com +timeout=2 +tries=1 " +
 		">/dev/null 2>&1 && echo ok")) == "ok";
