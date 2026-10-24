@@ -136,8 +136,8 @@ function communityListOption(s, name, title, description, defaults) {
 	o.validate = function (section_id, value) {
 		var vals = Array.isArray(value) ? value
 			: ((value != null && value !== '') ? [ value ] : []);
-		if (!vals.length)
-			return _('Выберите хотя бы один список сообщества.');
+		// пусто = «как по умолчанию» (apply.uc сам подставит defaults),
+		// поэтому пустой список ошибкой не считаем
 		for (var i = 0; i < vals.length; i++)
 			if (!DOMAIN_LIST_LABELS[vals[i]])
 				return _('Неизвестный список: ') + vals[i];
@@ -479,8 +479,11 @@ function updateArgs(ctx, rebuild) {
 		ytLists = listValues(ctx.ytLists, SETTINGS);
 		euLists = listValues(ctx.euLists, SETTINGS);
 
-		if (!ytLists.length || !euLists.length)
-			return Promise.reject(new Error(_('Выберите хотя бы один список сообщества для каждой WiFi-секции.')));
+		// пусто в форме = не трогали → берём те же дефолты, что и apply.uc
+		if (!ytLists.length)
+			ytLists = WIFI_LIST_DEFAULTS.yt.slice();
+		if (!euLists.length)
+			euLists = WIFI_LIST_DEFAULTS.eu.slice();
 	}
 
 	var args = [ 'update' ];
@@ -543,7 +546,7 @@ function reportNodes(r) {
 			out.push(act);
 
 		if (r.suspended_at)
-			out.push(E('p', {}, E('strong', {}, _('Пауза с: ')) + fmtDate(r.suspended_at)));
+			out.push(E('p', {}, [ E('strong', {}, _('Пауза с: ')), fmtDate(r.suspended_at) ]));
 
 		var lk = linksBlock(r.checked);
 		if (lk)
@@ -594,7 +597,7 @@ function reportNodes(r) {
 	}
 
 	if (r.lan)
-		out.push(E('p', {}, E('strong', {}, _('LAN: ')) + r.lan));
+		out.push(E('p', {}, [ E('strong', {}, _('LAN: ')), '' + r.lan ]));
 
 	var lk3 = linksBlock(r.checked);
 	if (lk3)
@@ -607,7 +610,7 @@ function reportNodes(r) {
 	}
 
 	if (r.removed && r.removed.length)
-		out.push(E('p', {}, E('strong', {}, _('Удалено: ')) + r.removed.join(', ')));
+		out.push(E('p', {}, [ E('strong', {}, _('Удалено: ')), r.removed.join(', ') ]));
 
 	var wl3 = listBlock(_('Предупреждения:'), warnings);
 	if (wl3)
@@ -678,7 +681,7 @@ function statusNodes(st) {
 			out.push(noteBox('warning', _('Подписка неактивна (истекла). Podkop и sing-box остановлены, автозапуск выключен. Планировщик продолжает проверять подписку и запустит туннель, когда панель отдаст серверы.')));
 		}
 		if (st.suspended_at)
-			out.push(E('p', {}, E('strong', {}, _('Пауза с: ')) + fmtDate(st.suspended_at)));
+			out.push(E('p', {}, [ E('strong', {}, _('Пауза с: ')), fmtDate(st.suspended_at) ]));
 	}
 	else if (st.status === 'error') {
 		out.push(noteBox('warning', _('Последняя проверка не удалась — podkop оставлен как есть, туннель не трогали.')));
@@ -702,7 +705,7 @@ function statusNodes(st) {
 	if (st.services) {
 		var svc = serviceText(st.services);
 		if (svc)
-			out.push(E('p', {}, E('strong', {}, _('Сервисы: ')) + svc));
+			out.push(E('p', {}, [ E('strong', {}, _('Сервисы: ')), svc ]));
 	}
 
 	var lines = (st.applied || []).map(appliedLine).filter(function (x) { return x != null; });

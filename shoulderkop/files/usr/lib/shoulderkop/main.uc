@@ -512,6 +512,17 @@ function wipe_sections() {
 // значения виджетов аргументами, а конфиг пишем здесь (uci.cursor), потому что
 // путь uci.save()/uci.apply() через rpcd на этой прошивке отдаёт Access denied.
 
+// --yt-lists=youtube,telegram → [ "youtube", "telegram" ]
+function split_arg_list(s) {
+	let out = [];
+	for (let v in split("" + s, ",")) {
+		v = trim(v);
+		if (v != "")
+			push(out, v);
+	}
+	return out;
+}
+
 function parse_args(argv) {
 	let a = { urls: [], rebuild: false };
 
@@ -538,17 +549,6 @@ function parse_args(argv) {
 	}
 
 	return a;
-}
-
-// --yt-lists=youtube,telegram → [ "youtube", "telegram" ]
-function split_arg_list(s) {
-	let out = [];
-	for (let v in split("" + s, ",")) {
-		v = trim(v);
-		if (v != "")
-			push(out, v);
-	}
-	return out;
 }
 
 function save_settings(a) {

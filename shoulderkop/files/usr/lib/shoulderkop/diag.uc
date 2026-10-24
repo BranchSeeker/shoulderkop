@@ -310,7 +310,7 @@ function set_dns_level(i, l, actions) {
 	return true;
 }
 
-function run_checks(quick) {
+function run_checks(quick, paused) {
 	let checks = [];
 
 	function add(name, ok, detail) {
@@ -327,6 +327,11 @@ function run_checks(quick) {
 		return checks;
 
 	add("podkop", podkop_enabled(), podkop_enabled() ? "автозапуск включён" : "автозапуск выключен");
+	// при истёкшей подписке lifecycle штатно гасит podkop: sing-box и nft
+	// отсутствуют намеренно, это не поломка
+	if (paused)
+		return checks;
+
 	add("sing-box", singbox_running(), singbox_running() ? "процесс работает" : "процесс не найден");
 	add("nft", nft_ok(), nft_ok() ? "таблица PodkopTable есть" : "таблицы PodkopTable нет");
 
@@ -406,7 +411,11 @@ function run(opts) {
 	let actions = [];
 	let errors = [];
 
-	let checks = run_checks(quick);
+	// подписка на паузе (истекла): lifecycle специально погасил podkop и снял
+	// автозапуск — не «чиним» это обратно, иначе диагностика воевала бы с паузой
+	let paused = (cfg("suspended", "0") == "1");
+
+	let checks = run_checks(quick, paused);
 	let bad = failed(checks);
 
 	// всё хорошо — молча выходим (в журнал попадём только при проблеме)
@@ -426,7 +435,7 @@ function run(opts) {
 
 	log_msg("проблема: " + join(", ", bad));
 
-	if (!quick && init_exists("podkop") && cfg_bool("diag_repair", true)) {
+	if (!quick && init_exists("podkop") && !paused && cfg_bool("diag_repair", true)) {
 		// 1. автозапуск podkop снят — возвращаем (это и есть «интернет пропал
 		//    после ребута»), если не в direct-режиме
 		if (!podkop_enabled() && init_exists("podkop") && !cfg_bool("direct_mode", false)) {
@@ -461,7 +470,7 @@ function run(opts) {
 		if (cfg_bool("direct_mode", false) && internet_ok() && opts.resume == true)
 			from_direct(l, actions);
 
-		checks = run_checks(false);
+		checks = run_checks(false, false);
 		bad = failed(checks);
 	}
 
@@ -469,6 +478,7 @@ function run(opts) {
 		ts: started,
 		ok: length(bad) == 0,
 		quick: quick,
+		paused: paused,
 		level: dns_level_get(),
 		checks: checks,
 		actions: actions,
