@@ -197,6 +197,61 @@ function nft_ok() {
 	return tunnel_up();
 }
 
+// Живы ли узлы. Спрашиваем у самого podkop через Clash API: у каждой нашей
+// секции есть urltest-группа "<section>-out", она умеет мерить задержку.
+// -1 — проверить не удалось, 0 — все мертвы, 1 — есть живой.
+function clash_group_delay(tag) {
+	let raw = trim(sh("/usr/bin/podkop clash_api get_group_latency '" + tag + "' 1500 2>/dev/null"));
+	if (raw == "")
+		return -1;
+	try {
+		let o = json(raw);
+		return int(o.delay || 0);
+	} catch (e) {
+		return -1;
+	}
+}
+
+function tunnel_groups() {
+	let out = [];
+	let c = uci.cursor();
+	if (!c.load("podkop"))
+		return out;
+	c.foreach("podkop", "section", function (s) {
+		if (substr(s[".name"], 0, 5) == "skop_")
+			push(out, s[".name"] + "-out");
+	});
+	return out;
+}
+
+function nodes_alive() {
+	let groups = tunnel_groups();
+	if (length(groups) == 0)
+		return -1;
+	let known = false;
+	for (let g in groups) {
+		let d = clash_group_delay(g);
+		if (d > 0)
+			return 1;
+		if (d >= 0)
+			known = true;
+	}
+	return known ? 0 : -1;
+}
+
+// Обновить подписку перед починкой: панель могла выдать другие узлы, а старые
+// уже мертвы. Не чаще раза в 30 минут, чтобы не долбить панель.
+function refresh_subscription(l, actions) {
+	let now = time();
+	if (now - int(l.last_update || 0) < 1800)
+		return false;
+	l.last_update = now;
+	limits_save(l);
+	push(actions, "подписка: обновляю перед проверкой узлов");
+	quiet("/usr/bin/shoulderkop update");
+	return true;
+}
+
 function podkop_state() {
 	let raw = trim(sh("/usr/bin/podkop get_status 2>/dev/null"));
 	if (raw == "")
@@ -436,9 +491,16 @@ function run(opts) {
 	log_msg("проблема: " + join(", ", bad));
 
 	if (!quick && init_exists("podkop") && !paused && cfg_bool("diag_repair", true)) {
+		let direct = cfg_bool("direct_mode", false);
+
+		// 0. интернета нет, а мы в туннеле: возможно, панель уже выдала другие
+		//    узлы — подтягиваем подписку (не чаще раза в 30 минут)
+		if (!internet_ok() && !direct)
+			refresh_subscription(l, actions);
+
 		// 1. автозапуск podkop снят — возвращаем (это и есть «интернет пропал
 		//    после ребута»), если не в direct-режиме
-		if (!podkop_enabled() && init_exists("podkop") && !cfg_bool("direct_mode", false)) {
+		if (!podkop_enabled() && !direct) {
 			quiet(PODKOP + " enable");
 			push(actions, "podkop: автозапуск включён");
 		}
@@ -447,9 +509,24 @@ function run(opts) {
 		if (!singbox_running() || !nft_ok())
 			restart_podkop(l, actions);
 
-		// 3. интернета всё ещё нет — спускаемся по DNS-лестнице до первой
+		// 3. все узлы мертвы — держать podkop включённым нельзя: он душит
+		//    интернет и ломает загрузку rule-set'ов (geoip.srs и т.п.).
+		//    Переводим всё в direct, пока не появятся живые серверы.
+		if (!internet_ok() && !direct && (singbox_running() || nft_ok())) {
+			system("sleep 3");
+			let na = nodes_alive();
+			if (na == 0) {
+				push(actions, "все узлы мертвы — перевожу всё в direct");
+				to_direct(l, actions);
+				direct = cfg_bool("direct_mode", false);
+			} else if (na == 1) {
+				push(actions, "узлы живы — проблема не в серверах");
+			}
+		}
+
+		// 4. интернета всё ещё нет — спускаемся по DNS-лестнице до первой
 		//    рабочей ступени (DoH → DoT → UDP 77.88.8.8)
-		if (!internet_ok()) {
+		if (!internet_ok() && !direct) {
 			let lvl = dns_level_get();
 			let from = (lvl >= 0) ? lvl + 1 : 0;
 			let next = first_working_from(from);
@@ -461,12 +538,11 @@ function run(opts) {
 				push(actions, "dns: ни одна ступень не отвечает — проблема не в DNS");
 		}
 
-		// 4. всё ещё нет интернета — переводим в direct, чтобы LAN не остался
-		//    без сети совсем
-		if (!internet_ok())
+		// 5. последний рубеж — direct, чтобы LAN не остался без сети совсем
+		if (!internet_ok() && !direct)
 			to_direct(l, actions);
 
-		// 5. direct и интернет есть, а узлы уже живы — возвращаемся
+		// 6. direct и узлы снова живы — возвращаемся в туннель
 		if (cfg_bool("direct_mode", false) && internet_ok() && opts.resume == true)
 			from_direct(l, actions);
 

@@ -12,7 +12,7 @@ config settings 'settings'
 	# list wifi_eu_lists 'russia_inside'
 	# list wifi_eu_lists 'telegram'
 	# Ссылка подписки задаётся в LuCI (страница Shoulderkop).
-	option update_interval '1h'
+	option update_interval '30m'
 	# 30s|1m|2m|3m|5m|10m — как часто группа проверяет серверы и выбирает лучший
 	option urltest_interval '30s'
 	option enable_schedule '1'

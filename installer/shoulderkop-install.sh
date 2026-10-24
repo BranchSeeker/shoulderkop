@@ -72,6 +72,9 @@ REMOVED_DNS=0
 SUB_TRIED=0
 SUB_OK=0
 SUB_PAUSED=0
+BEFORE_SK=""
+BEFORE_PK=""
+BEFORE_SB=""
 SUB_COUNT=""
 
 # ---------- оформление ----------
@@ -1349,6 +1352,23 @@ configure() {
 	[ -x /etc/init.d/shoulderkop ] || die "нет /etc/init.d/shoulderkop — пакет встал криво"
 	[ -x /usr/bin/shoulderkop ] || die "нет /usr/bin/shoulderkop — пакет встал криво"
 
+	# повторный запуск «всё уже стоит и настроено»: не дёргаем подписку и podkop,
+	# иначе каждый запуск установщика заново ходит в панель и перестраивает секции
+	_now_sk=$(sk_version); _now_pk=$(podkop_version); _now_sb=$(singbox_version)
+	_same=1
+	[ "$_now_sk" = "$BEFORE_SK" ] || _same=0
+	[ "$_now_pk" = "$BEFORE_PK" ] || _same=0
+	[ "$_now_sb" = "$BEFORE_SB" ] || _same=0
+	_susp_now=$(uci -q get shoulderkop.settings.suspended 2>/dev/null)
+	if [ "$_same" -eq 1 ] && [ "$FORCE" -eq 0 ] && [ "$DRY" -eq 0 ] \
+	   && [ -z "$URL$MODE$INTERVAL$URLTEST$SCHEDULE" ] \
+	   && [ "$_susp_now" != "1" ] && sub_url_set; then
+		ok "всё актуально: shoulderkop ${_now_sk:-?}, podkop ${_now_pk:-?}, подписка задана"
+		ok "ничего не меняю — подписку и секции podkop не трогаю"
+		/usr/bin/shoulderkop schedule >/dev/null 2>&1
+		return 0
+	fi
+
 	/etc/init.d/shoulderkop enable >/dev/null 2>&1 && ok "shoulderkop в автозапуске"
 	if [ -x /etc/init.d/podkop ]; then
 		/etc/init.d/podkop enable >/dev/null 2>&1
@@ -1365,7 +1385,7 @@ configure() {
 		uci -q set "shoulderkop.settings.update_interval=$INTERVAL" && _uci_changed=1
 	fi
 	if [ -z "$(uci -q get shoulderkop.settings.update_interval)" ]; then
-		uci -q set "shoulderkop.settings.update_interval=1h" && _uci_changed=1
+		uci -q set "shoulderkop.settings.update_interval=30m" && _uci_changed=1
 	fi
 	if [ -n "$URLTEST" ]; then
 		uci -q set "shoulderkop.settings.urltest_interval=$URLTEST" && _uci_changed=1
@@ -1736,6 +1756,9 @@ main() {
 	fi
 
 	detect_env
+	BEFORE_SK=$(sk_version)
+	BEFORE_PK=$(podkop_version)
+	BEFORE_SB=$(singbox_version)
 	pick_work
 
 	print_banner

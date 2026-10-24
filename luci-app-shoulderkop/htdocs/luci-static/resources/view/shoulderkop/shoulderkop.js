@@ -492,7 +492,7 @@ function updateArgs(ctx, rebuild) {
 	urls.forEach(function (u) { args.push('--url=' + ('' + u).trim()); });
 
 	args.push('--mode=' + mode);
-	args.push('--interval=' + (ctx.interval.formvalue(SETTINGS) || '1h'));
+	args.push('--interval=' + (ctx.interval.formvalue(SETTINGS) || '30m'));
 	args.push('--urltest=' + (ctx.urltest.formvalue(SETTINGS) || '30s'));
 	args.push('--schedule=' + flagValue(ctx.sched.formvalue(SETTINGS)));
 
@@ -924,7 +924,7 @@ return view.extend({
 		o.value('6h', _('Каждые 6 часов'));
 		o.value('12h', _('Каждые 12 часов'));
 		o.value('1d', _('Каждый день'));
-		o.default = '1h';
+		o.default = '30m';
 		ctx.interval = o;
 
 		o = s.option(form.Flag, 'enable_schedule', _('Обновлять по расписанию'),
