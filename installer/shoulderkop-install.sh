@@ -1478,7 +1478,7 @@ verify() {
 		if singbox_extended "$_v"; then
 			ok "sing-box $_v (extended)"
 		else
-			warn "sing-box $_v без xhttp"
+			hint "sing-box $_v без xhttp — такие узлы будут пропущены"
 		fi
 	else
 		warn "sing-box не отвечает"

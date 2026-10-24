@@ -596,8 +596,16 @@ function save_settings(a) {
 		dirty++;
 	}
 
-	if (length(a.urls) > 0)
-		put("subscription_url", a.urls);
+	// file:// и прочие не-HTTP адреса — отладочные (--url=file:///…): в конфиг
+	// их не пишем, иначе тестовый запуск затрёт настоящую подписку
+	let http_urls = [];
+	for (let u in a.urls) {
+		let v = trim("" + u);
+		if (substr(v, 0, 7) == "http://" || substr(v, 0, 8) == "https://")
+			push(http_urls, v);
+	}
+	if (length(http_urls) > 0)
+		put("subscription_url", http_urls);
 	put("mode", a.mode);
 	put("update_interval", a.interval);
 	put("urltest_interval", a.urltest);
