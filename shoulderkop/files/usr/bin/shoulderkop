@@ -1,0 +1,3 @@
+#!/bin/sh
+# shoulderkop — обёртка: запускает ucode-модуль с путём поиска модулей.
+exec ucode -L /usr/lib/shoulderkop /usr/lib/shoulderkop/main.uc "$@"

@@ -1,0 +1,196 @@
+name: build
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+    paths:
+      - 'shoulderkop/**'
+      - 'luci-app-shoulderkop/**'
+      - 'installer/**'
+      - '.github/workflows/build.yml'
+  pull_request:
+    paths:
+      - 'shoulderkop/**'
+      - 'luci-app-shoulderkop/**'
+      - 'installer/**'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TARGET_PATH: x86/64
+  TARGET_NAME: x86-64
+
+jobs:
+  lint:
+    name: Проверки
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shell-скрипты
+        run: |
+          set -e
+          sh -n installer/shoulderkop-install.sh
+          sh -n shoulderkop/files/usr/bin/shoulderkop
+          sh -n shoulderkop/files/etc/init.d/shoulderkop
+
+      - name: JS LuCI
+        run: node --check luci-app-shoulderkop/htdocs/luci-static/resources/view/shoulderkop/shoulderkop.js
+
+      - name: JSON меню и ACL
+        run: |
+          set -e
+          for f in luci-app-shoulderkop/root/usr/share/luci/menu.d/*.json \
+                   luci-app-shoulderkop/root/usr/share/rpcd/acl.d/*.json; do
+            python3 -m json.tool "$f" > /dev/null
+          done
+
+      - name: ucode (синтаксис, если есть в apt)
+        continue-on-error: true
+        run: |
+          sudo apt-get update -qq
+          if sudo apt-get install -y -qq ucode > /dev/null 2>&1; then
+            for f in shoulderkop/files/usr/lib/shoulderkop/*.uc; do
+              ucode -c "$f" || exit 1
+            done
+          else
+            echo "ucode нет в apt — шаг пропущен"
+          fi
+
+  build:
+    name: Сборка ${{ matrix.ext }}
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - ext: apk
+            sdk: '25.12.6'
+          - ext: ipk
+            sdk: '24.10.8'
+    env:
+      PKG_EXT: ${{ matrix.ext }}
+      SDK_VERSION: ${{ matrix.sdk }}
+      SDK_CACHE: ${{ github.workspace }}/.sdk-cache
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Место на диске
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          df -h /
+
+      - name: Зависимости сборки
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential gawk gettext libncurses-dev \
+            unzip zstd rsync python3 file wget
+
+      - name: Кэш SDK
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.SDK_CACHE }}
+          key: sdk-${{ matrix.sdk }}-${{ env.TARGET_NAME }}-v1
+
+      - name: Скачать SDK
+        run: |
+          set -euo pipefail
+          mkdir -p "$SDK_CACHE"
+          if ! ls "$SDK_CACHE"/sdk.tar.* > /dev/null 2>&1; then
+            URL="https://downloads.openwrt.org/releases/${SDK_VERSION}/targets/${TARGET_PATH}/"
+            FILE=$(curl -fsSL "$URL" | grep -o 'openwrt-sdk-[^"<]*\.tar\.\(zst\|xz\)' | head -n 1)
+            test -n "$FILE"
+            echo "SDK: $FILE"
+            curl -fL --retry 3 -o "$SDK_CACHE/sdk.tar.${FILE##*.}" "$URL$FILE"
+          fi
+          ls -lh "$SDK_CACHE"
+
+      - name: Распаковать SDK
+        run: |
+          set -euo pipefail
+          ARC=$(ls "$SDK_CACHE"/sdk.tar.* | head -n 1)
+          case "$ARC" in
+            *.zst) tar --zstd -xf "$ARC" ;;
+            *)     tar -xf "$ARC" ;;
+          esac
+          SDK_DIR=$(find . -maxdepth 1 -type d -name 'openwrt-sdk-*' | head -n 1)
+          test -n "$SDK_DIR"
+          echo "SDK_DIR=$SDK_DIR" >> "$GITHUB_ENV"
+          echo "SDK: $SDK_DIR"
+
+      - name: Собрать пакеты
+        run: |
+          set -euo pipefail
+          cp -r shoulderkop luci-app-shoulderkop "$SDK_DIR/package/"
+          cd "$SDK_DIR"
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          make defconfig
+          make package/shoulderkop/compile V=s -j"$(nproc)"
+          make package/luci-app-shoulderkop/compile V=s -j"$(nproc)"
+
+      - name: Собрать артефакты
+        # трогаем только свои пакеты: bin/packages кроме них содержит зависимости
+        # из фидов, собранные как побочный эффект (curl, ubus, uci, lua, ...)
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          find "$SDK_DIR/bin/packages" -type f \( \
+            -name "shoulderkop[-_]*.$PKG_EXT" -o \
+            -name "luci-app-shoulderkop[-_]*.$PKG_EXT" \) -exec cp -v {} out/ \;
+          ls -1 out/
+          test "$(ls -1 out | wc -l)" -eq 2
+          ls -lh out/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shoulderkop-${{ matrix.ext }}
+          path: out/*
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Релиз
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: shoulderkop-*
+          path: out
+          merge-multiple: true
+
+      - name: Проверить файлы и собрать SHA256SUMS
+        run: |
+          set -euo pipefail
+          ls -lh out
+          # в релизе ровно 4 пакета: apk и ipk, каждый по 2 штуки
+          test "$(ls -1 out/*.apk | wc -l)" -eq 2
+          test "$(ls -1 out/*.ipk | wc -l)" -eq 2
+          (cd out && sha256sum *.apk *.ipk > SHA256SUMS)
+          cat out/SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            out/*.apk
+            out/*.ipk
+            out/SHA256SUMS
+          generate_release_notes: true
+          fail_on_unmatched_files: true

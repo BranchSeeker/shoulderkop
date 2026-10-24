@@ -1,0 +1,28 @@
+#!/bin/sh /etc/rc.common
+
+START=99
+
+# shoulderkop не держит демон — только управляет cron-задачей обновления подписки.
+# Логика лежит в самом shoulderkop (команда `schedule`), чтобы у LuCI и rc был
+# один и тот же путь записи в /etc/crontabs/root.
+#
+# Сами обновления: `shoulderkop update` → fetch → parse → apply → /etc/init.d/podkop reload.
+
+start() {
+	/usr/bin/shoulderkop schedule >/dev/null 2>&1
+}
+
+# stop() намеренно не задан: при выключении OpenWrt дёргает K-симлинк, и
+# `schedule off` снёс бы и cron-строку, и сам S99-симлинк — после первого же
+# ребута автозапуск терялся бы навсегда. Снимает всё только `schedule off`
+# из prerm при удалении пакета.
+
+reload() {
+	start
+}
+
+# enable/disable из rc.common управляют только симлинком в /etc/rc.d; сам cron
+# ставится/снимается командой `shoulderkop schedule [off]` по enable_schedule.
+boot() {
+	start "$@"
+}

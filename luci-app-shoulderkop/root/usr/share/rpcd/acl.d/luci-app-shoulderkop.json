@@ -1,0 +1,16 @@
+{
+	"luci-app-shoulderkop": {
+		"description": "Grant access to shoulderkop (subscription manager for podkop)",
+		"read": {
+			"uci": [ "shoulderkop", "podkop" ],
+			"file": {
+				"/usr/bin/shoulderkop": [ "exec" ],
+				"/tmp/shoulderkop.cache.json": [ "read" ],
+				"/tmp/shoulderkop.state.json": [ "read" ]
+			}
+		},
+		"write": {
+			"uci": [ "shoulderkop", "podkop" ]
+		}
+	}
+}

@@ -1,0 +1,10 @@
+{
+	"admin/services/shoulderkop": {
+		"title": "Shoulderkop",
+		"order": 60,
+		"action": {
+			"type": "view",
+			"path": "shoulderkop/shoulderkop"
+		}
+	}
+}

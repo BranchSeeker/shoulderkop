@@ -1,0 +1,15 @@
+# Скрипты и исходники должны оставаться с LF: CRLF ломает sh на роутере
+# ("bad interpreter" / "\r: not found"), а также ucode-файлы и LuCI-JS.
+* text=auto eol=lf
+
+*.sh   text eol=lf
+*.uc   text eol=lf
+*.js   text eol=lf
+*.json text eol=lf
+*.md   text eol=lf
+
+# Бинарные артефакты не трогаем
+*.apk  binary
+*.ipk  binary
+*.zst  binary
+*.png  binary

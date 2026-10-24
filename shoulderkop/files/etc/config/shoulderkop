@@ -1,0 +1,43 @@
+config settings 'settings'
+	# LTE — весь LAN в туннель, списки РКН напрямую;
+	# wifi — только секции YT/EU в туннель, остальное напрямую.
+	option mode 'wifi'
+	# Списки сообщества podkop для WiFi-секций (community_lists). В LuCI —
+	# «Списки сообщества — YouTube» и «— остальные сервисы». Пока опций нет,
+	# apply.uc берёт захардкоженные значения по умолчанию:
+	#   wifi_yt_lists = youtube
+	#   wifi_eu_lists = russia_inside telegram meta cloudflare hodca roblox
+	# Пустой список тоже означает «по умолчанию».
+	# list wifi_yt_lists 'youtube'
+	# list wifi_eu_lists 'russia_inside'
+	# list wifi_eu_lists 'telegram'
+	# Ссылка подписки задаётся в LuCI (страница Shoulderkop).
+	option update_interval '1h'
+	# 30s|1m|2m|3m|5m|10m — как часто группа проверяет серверы и выбирает лучший
+	option urltest_interval '30s'
+	option enable_schedule '1'
+
+	# Сетевая диагностика: раз в 5 минут проверяем интернет (gstatic) и, если
+	# что-то сломалось, чиним — автозапуск podkop, перезапуск, DNS-лестница,
+	# при полном отсутствии живых узлов — всё в direct.
+	option diag_enabled '1'
+	option diag_repair '1'
+	option diag_interval '5m'
+	# 0 — в туннеле, 1 — podkop остановлен, весь трафик напрямую (ставится
+	# автоматически, когда узлы мертвы; снимается после обновления подписки)
+	option direct_mode '0'
+
+	# Служебное: пишется автоматически при установке и на каждом старте.
+	# user_agent захардкожен (Remnawave отдаёт Xray JSON только для Happ),
+	# hwid генерируется из MAC роутера при первом запуске.
+	option user_agent 'Happ/2.7.0'
+	option hwid ''
+
+	# Пауза туннеля при истёкшей подписке: 1 — podkop/sing-box остановлены,
+	# автозапуск снят, cron продолжает проверять подписку. Ставится и снимается
+	# автоматически, в LuCI не редактируется.
+	option suspended '0'
+
+	# Служебное: число активных подписок в прошлый раз. Если оно уменьшилось
+	# (ссылка истекла или её убрали), секции podkop пересобираются один раз.
+	option last_active_subs '0'

@@ -1,0 +1,18 @@
+#!/bin/sh
+# shoulderkop — быстрая диагностика при поднятии WAN.
+#
+# Актуально для LTE: модем переподключается, podkop мог успеть упасть на старом
+# маршруте. Здесь только лёгкая проверка (--quick) в фоне, без починки: полный
+# проход с перезапусками делает cron каждые 5 минут, иначе каждый ifup дёргал бы
+# podkop заново.
+
+[ "$ACTION" = "ifup" ] || exit 0
+case "$INTERFACE" in
+	wan|wwan*) ;;
+	*) exit 0 ;;
+esac
+
+[ -x /usr/bin/shoulderkop ] || exit 0
+
+( /usr/bin/shoulderkop diag --quick --quiet >/dev/null 2>&1 & ) &
+exit 0
