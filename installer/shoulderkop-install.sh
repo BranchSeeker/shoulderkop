@@ -14,7 +14,7 @@
 set -u
 
 APP="ShoulderKop installer"
-VER="2.0"
+VER="2.1"
 UA="shoulderkop-installer/$VER"
 
 PODKOP_REPO="itdoginfo/podkop"
@@ -76,6 +76,9 @@ BEFORE_SK=""
 BEFORE_PK=""
 BEFORE_SB=""
 SUB_COUNT=""
+PK_PRESENT=0
+SBE_PRESENT=0
+SBE_SPACE_OK=1
 
 # ---------- оформление ----------
 
@@ -338,6 +341,15 @@ singbox_extended() {
 		*) return 1 ;;
 	esac
 }
+# Хватит ли места под sing-box-extended: пороги те же, что в авто-выборе
+# формата в step_singbox(). Минимум — сжатое ядро: ~30 МБ в /overlay и
+# ~100 МБ в /tmp; apk-формат требует ~100 МБ в /overlay.
+sbe_space_ok() {
+	[ "$PKG" = "apk" ] && [ "$OVERLAY_KB" -ge 102400 ] && return 0
+	[ "$OVERLAY_KB" -ge 112640 ] && [ "$TMP_KB" -ge 174080 ] && return 0
+	[ "$OVERLAY_KB" -ge 30720 ] && [ "$TMP_KB" -ge 102400 ] && return 0
+	return 1
+}
 # Установленная версия shoulderkop (без суффиксов -rN / -N): для проверки обновлений
 sk_version() {
 	case "$PKG" in
@@ -532,13 +544,47 @@ preflight() {
 		fi
 	fi
 
-	if [ "$OVERLAY_KB" -lt 15360 ]; then
+	# Сначала смотрим, что уже установлено: при обновлении не надо требовать
+	# место под установку podkop с нуля. Иначе повторный запуск падает с
+	# «мало места», хотя ставить podkop заново никто не собирается.
+	PK_PRESENT=0
+	if pkg_installed podkop >/dev/null 2>&1 || [ -x /usr/bin/podkop ]; then
+		PK_PRESENT=1
+	fi
+
+	if [ "$PK_PRESENT" -eq 1 ]; then
+		ok "podkop уже установлен — проверку 15 МБ под его установку пропускаю"
+	elif [ "$DO_PODKOP" -eq 0 ]; then
+		ok "podkop не ставим (--no-podkop) — проверка 15 МБ не нужна"
+	elif [ "$OVERLAY_KB" -lt 15360 ]; then
 		die "мало места в /overlay: podkop требует минимум 15 МБ, свободно $(mb "$OVERLAY_KB") МБ"
 	fi
+
 	if [ "$OVERLAY_KB" -lt 25600 ]; then
 		warn "в /overlay $(mb "$OVERLAY_KB") МБ — впритык, а подписка и кэш любят место"
 	else
 		ok "места в /overlay: $(mb "$OVERLAY_KB") МБ"
+	fi
+
+	# Хватит ли места под sing-box-extended. Проверяем до вопросов, чтобы
+	# не предлагать то, что физически не влезет.
+	SBE_PRESENT=0
+	_cur=$(singbox_version)
+	if [ -n "$_cur" ] && singbox_extended "$_cur"; then
+		SBE_PRESENT=1
+	fi
+	SBE_SPACE_OK=0
+	if sbe_space_ok; then
+		SBE_SPACE_OK=1
+	fi
+	if [ "$DO_SINGBOX" -eq 1 ]; then
+		if [ "$SBE_PRESENT" -eq 1 ]; then
+			info "sing-box extended уже установлен"
+		elif [ "$SBE_SPACE_OK" -eq 1 ]; then
+			info "места под sing-box-extended хватает"
+		else
+			warn "места под sing-box-extended нет — обновлю только shoulderkop"
+		fi
 	fi
 
 	if [ "$TMP_KB" -lt 10240 ]; then
@@ -553,6 +599,23 @@ collect_answers() {
 		_cur=$(singbox_version)
 		if [ -n "$_cur" ] && singbox_extended "$_cur" && ver_ge "$_cur" "$SBE_MIN" && [ "$FORCE" -eq 0 ]; then
 			WANT_EXTENDED=1
+		elif [ "$SBE_SPACE_OK" -eq 0 ]; then
+			# extended не влезает: обновляем только shoulderkop, чтобы не падать
+			WANT_EXTENDED=0
+			warn "места под sing-box-extended не хватает — обновляю только shoulderkop"
+			hint "extended нужен для xhttp-узлов; освободите место и перезапустите установщик"
+			if [ -n "$_cur" ]; then
+				if singbox_extended "$_cur"; then
+					hint "сейчас стоит sing-box $_cur (extended), но он устарел"
+				else
+					hint "сейчас стоит обычный sing-box $_cur — xhttp-узлы будут выкинуты"
+				fi
+				if ! ver_ge "$_cur" "1.12.4"; then
+					warn "podkop требует sing-box >= 1.12.4, а сейчас $_cur"
+				fi
+			else
+				hint "xhttp-узлы будут выкинуты — sing-box-extended не влезет по месту"
+			fi
 		elif [ "$INTERACTIVE" -eq 1 ]; then
 			blank
 			hint "sing-box-extended нужен для xhttp-узлов."
