@@ -353,6 +353,15 @@ function xhttp_extra_json(tr) {
 }
 
 function build_link(ob) {
+	if (type(ob) != "object")
+		return null;
+
+	// podkop-секции могут содержать и не-vless outbound (например, urltest-
+	// группу). Ссылку из такого объекта не собрать — пусть решает вызывающий.
+	let proto = lc(as_string(ob.type || "vless"));
+	if (proto != "vless")
+		return null;
+
 	let params = [];
 
 	function add(k, v) {

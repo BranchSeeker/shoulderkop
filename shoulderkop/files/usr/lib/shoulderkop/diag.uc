@@ -197,8 +197,9 @@ function nft_ok() {
 	return tunnel_up();
 }
 
-// Живы ли узлы. Спрашиваем у самого podkop через Clash API: у каждой нашей
-// секции есть urltest-группа "<section>-out", она умеет мерить задержку.
+// Живы ли узлы. Спрашиваем у самого podkop через Clash API: у нативной
+// urltest-секции группа называется "<section>-urltest-out", у синтетической
+// (outbound_json) — "<section>-out". Обе умеют мерить задержку.
 // -1 — проверить не удалось, 0 — все мертвы, 1 — есть живой.
 function clash_group_delay(tag) {
 	let raw = trim(sh("/usr/bin/podkop clash_api get_group_latency '" + tag + "' 1500 2>/dev/null"));
@@ -218,8 +219,10 @@ function tunnel_groups() {
 	if (!c.load("podkop"))
 		return out;
 	c.foreach("podkop", "section", function (s) {
-		if (substr(s[".name"], 0, 5) == "skop_")
-			push(out, s[".name"] + "-out");
+		if (substr(s[".name"], 0, 5) != "skop_")
+			return;
+		let pct = trim("" + (s.proxy_config_type || ""));
+		push(out, s[".name"] + ((pct == "urltest") ? "-urltest-out" : "-out"));
 	});
 	return out;
 }

@@ -78,6 +78,13 @@ function parse_xray_json(text, allow_xhttp) {
 					reason: "reality without public key" });
 				continue;
 			}
+			// build_outbound умеет только vless; остальные протоколы
+			// (vmess/ss/trojan) в podkop-секции не отдаём
+			if (lc(as_string(ob.type)) != "vless") {
+				push(skipped, { name: ob.tag,
+					reason: "unsupported protocol " + as_string(ob.type) });
+				continue;
+			}
 			let id = convert.outbound_identity(ob);
 			if (seen[id])
 				continue;
@@ -100,11 +107,26 @@ function is_base64(s) {
 	for (let i = 0; i < length(s); i++) {
 		let c = ord(substr(s, i, 1));
 		let ok = (c >= 0x41 && c <= 0x5A) || (c >= 0x61 && c <= 0x7A) ||
-			(c >= 0x30 && c <= 0x39) || c == 0x2B || c == 0x2F || c == 0x3D;
+			(c >= 0x30 && c <= 0x39) || c == 0x2B || c == 0x2F || c == 0x3D ||
+			c == 0x2D || c == 0x5F;
 		if (!ok)
 			return false;
 	}
 	return true;
+}
+
+// ucode: b64dec(), а не b64decode(). Плюс подписки часто в URL-safe base64
+// ('-' вместо '+', '_' вместо '/') — нормализуем перед декодированием.
+function decode_b64(s) {
+	s = replace(replace(trim(s), "-", "+"), "_", "/");
+	let pad = length(s) % 4;
+	if (pad == 2)
+		s += "==";
+	else if (pad == 3)
+		s += "=";
+	else if (pad == 1)
+		return null;
+	try { return b64dec(s); } catch (e) { return null; }
 }
 
 function parse_links(text, allow_xhttp) {
@@ -150,7 +172,7 @@ function parse_subscription(text, allow_xhttp) {
 
 	// base64?
 	if (is_base64(text)) {
-		let decoded = b64decode(trim(text));
+		let decoded = decode_b64(trim(text));
 		if (decoded != null && decoded != "") {
 			let r = parse_subscription(decoded, allow_xhttp);
 			if (length(r.nodes) > 0)

@@ -6,6 +6,7 @@
 //                        при истёкшей подписке — остановить podkop/sing-box
 //   apply              — то же, но без скачивания: применить узлы из кэша
 //   list_servers       — вывести узлы из кэша (при пустом кэше — сходить в подписку)
+//   links              — outbounds подписки/секций podkop → vless:// ссылки
 //   status             — вывести состояние последнего обновления и паузы
 //   schedule [off]     — переустановить cron-задачу по enable_schedule/update_interval
 
@@ -14,6 +15,7 @@
 let fs = require("fs");
 let uci = require("uci");
 let subscription = require("subscription");
+let convert = require("convert");
 let applymod = require("apply");
 let lifecycle = require("lifecycle");
 let diagmod = require("diag");
@@ -67,7 +69,18 @@ function uci_list(config, section, option) {
 	let raw = trim(sh("uci -q get " + config + "." + section + "." + option + " 2>/dev/null"));
 	if (raw == "")
 		return [];
-	return split(raw, "\n");
+
+	// uci отдаёт list-опцию одной строкой через пробел; иногда значения
+	// попадают и с переводами строк. Делим по любому пробельному символу,
+	// иначе два URL склеиваются в один и curl отвечает «URL rejected».
+	raw = replace(replace(raw, "\n", " "), "\t", " ");
+	let out = [];
+	for (let part in split(raw, " ")) {
+		part = trim(part);
+		if (part != "")
+			push(out, part);
+	}
+	return out;
 }
 
 function uci_set(config, section, option, value) {
@@ -858,6 +871,260 @@ function cmd_list_servers() {
 	return 0;
 }
 
+// ---- links: outbounds → vless:// -----------------------------------------
+//
+// Обратная операция к convert.uc: берём узлы подписки (из кэша, файла или
+// URL) либо outbound_json уже разложенных секций podkop и печатаем vless-ссылки.
+// Это то, что podkop кладёт в urltest_proxy_links для нативных urltest-секций.
+//
+//   shoulderkop links [--section=yt|eu|lte] [--json] [--grouped]
+//                     [--file=SUB] [--url=URL] [--mode=wifi|lte]
+//   shoulderkop links --podkop [--section=yt|eu|lte]
+
+function as_array(v) {
+	if (type(v) == "array")
+		return v;
+	if (v == null || "" + v == "")
+		return [];
+	return [ "" + v ];
+}
+
+function links_section_match(name, want) {
+	if (want == null || want == "" || want == "all")
+		return true;
+	if (name == want)
+		return true;
+	return (name == "skop_" + want);
+}
+
+// имя узла из #fragment ссылки (для --podkop --json)
+function link_tag(link) {
+	let h = index(link, "#");
+	return (h < 0) ? "" : convert.uri_decode(substr(link, h + 1));
+}
+
+// заглушки «Приложение не подходит» / «Рекомендуется Happ» — не серверы
+function links_real_nodes(list) {
+	let out = [];
+	for (let n in list)
+		if (!subscription.is_placeholder_node(n))
+			push(out, n);
+	return out;
+}
+
+function links_parse_file(file) {
+	let text = fs.readfile(file);
+	if (text == null || trim(text) == "")
+		return null;
+	try {
+		return links_real_nodes(subscription.parse_subscription(text, engine_extended()).nodes);
+	} catch (e) {
+		return null;
+	}
+}
+
+function links_parse_url(url) {
+	let ua = uci_get("shoulderkop", "settings", "user_agent");
+	if (ua == "")
+		ua = UA;
+	let res = fetch_one(url, ua, uci_get("shoulderkop", "settings", "hwid"));
+	if (res.http < 200 || res.http >= 300)
+		return null;
+	try {
+		return links_real_nodes(subscription.parse_subscription(res.body, engine_extended()).nodes);
+	} catch (e) {
+		return null;
+	}
+}
+
+function links_cache_nodes() {
+	let raw = fs.readfile(CACHE);
+	if (raw != null && raw != "") {
+		try {
+			let cache = json(raw);
+			if (type(cache) == "object" && length(cache.nodes || []) > 0)
+				return cache.nodes;
+		} catch (e) { }
+	}
+
+	// кэша нет — идём в подписку, как list_servers
+	let fetched = fetch_nodes();
+	return (fetched.status == "active") ? fetched.nodes : [];
+}
+
+// outbound_json секции (включая синтетическую urltest-группу) → ссылки
+function podkop_outbound_links(c, sec, depth) {
+	if (depth > 6)
+		return [];
+
+	let out = [];
+	let pct = trim("" + (c.get("podkop", sec, "proxy_config_type") || ""));
+
+	if (pct == "urltest" || pct == "selector") {
+		let opt = (pct == "urltest") ? "urltest_proxy_links" : "selector_proxy_links";
+		return as_array(c.get("podkop", sec, opt));
+	}
+
+	if (pct == "url") {
+		let s = trim("" + (c.get("podkop", sec, "proxy_string") || ""));
+		if (substr(s, 0, 8) == "vless://")
+			push(out, s);
+		return out;
+	}
+
+	let raw = c.get("podkop", sec, "outbound_json");
+	if (raw == null || "" + raw == "")
+		return out;
+
+	let ob = null;
+	try { ob = json(raw); } catch (e) { ob = null; }
+	if (type(ob) != "object")
+		return out;
+
+	let t = lc("" + (ob.type || "vless"));
+	if (t == "vless") {
+		let link = convert.build_link(ob);
+		if (link != null)
+			push(out, link);
+		return out;
+	}
+
+	// синтетическая группа: outbounds — теги дочерних секций <child>-out
+	if (t == "urltest" || t == "selector") {
+		for (let tag in as_array(ob.outbounds)) {
+			let child = "" + tag;
+			if (length(child) > 4 && substr(child, length(child) - 4) == "-out")
+				child = substr(child, 0, length(child) - 4);
+			if (child == sec)
+				continue;
+			for (let l in podkop_outbound_links(c, child, depth + 1))
+				push(out, l);
+		}
+	}
+	return out;
+}
+
+function podkop_links(section) {
+	let c = uci.cursor();
+	if (!c.load("podkop"))
+		return [];
+
+	let names = [];
+	c.foreach("podkop", "section", function (s) {
+		push(names, s[".name"]);
+	});
+
+	let rows = [];
+	for (let sec in names) {
+		if (substr(sec, 0, 5) != "skop_")
+			continue;
+		if (!links_section_match(sec, section))
+			continue;
+		if (trim("" + (c.get("podkop", sec, "connection_type") || "")) != "proxy")
+			continue;
+
+		for (let link in podkop_outbound_links(c, sec, 0))
+			push(rows, { section: sec, name: link_tag(link), link: link });
+	}
+	return rows;
+}
+
+function cmd_links(argv) {
+	let a = {
+		json: false, grouped: false, podkop: false, duplicates: false,
+		section: "", file: null, url: null, mode: null
+	};
+
+	for (let i = 1; i < length(argv); i++) {
+		let v = argv[i];
+		if (v == "--json")
+			a.json = true;
+		else if (v == "--grouped")
+			a.grouped = true;
+		else if (v == "--podkop")
+			a.podkop = true;
+		else if (v == "--duplicates")
+			a.duplicates = true;
+		else if (substr(v, 0, 10) == "--section=")
+			a.section = substr(v, 10);
+		else if (substr(v, 0, 7) == "--file=")
+			a.file = substr(v, 7);
+		else if (substr(v, 0, 6) == "--url=")
+			a.url = substr(v, 6);
+		else if (substr(v, 0, 7) == "--mode=")
+			a.mode = substr(v, 7);
+	}
+
+	let rows = [];
+
+	if (a.podkop) {
+		rows = podkop_links(a.section);
+	} else {
+		let nodes = null;
+		if (a.file != null)
+			nodes = links_parse_file(a.file);
+		else if (a.url != null)
+			nodes = links_parse_url(a.url);
+		else
+			nodes = links_cache_nodes();
+
+		if (nodes == null) {
+			print(sprintf("%J", { error: "cannot read or parse subscription" }));
+			return 1;
+		}
+		if (length(nodes) == 0) {
+			print(sprintf("%J", { error: "no nodes" }));
+			return 1;
+		}
+
+		let mode = a.mode;
+		if (mode == null || mode == "")
+			mode = uci_get("shoulderkop", "settings", "mode");
+
+		for (let g in applymod.plan_sections(mode, nodes)) {
+			if (!links_section_match(g.name, a.section))
+				continue;
+			for (let n in g.nodes) {
+				if (n.link == null || n.link == "")
+					continue;
+				push(rows, { section: g.name, name: n.name, link: n.link });
+			}
+		}
+	}
+
+	if (length(rows) == 0) {
+		print(sprintf("%J", { error: "no links", section: a.section }));
+		return 1;
+	}
+
+	// по умолчанию уникальные ссылки: yt и eu могут пересекаться
+	let out = [];
+	let seen = {};
+	for (let r in rows) {
+		if (!a.duplicates && seen[r.link])
+			continue;
+		seen[r.link] = true;
+		push(out, r);
+	}
+
+	if (a.json) {
+		print(sprintf("%J", out));
+		return 0;
+	}
+
+	let last = "";
+	for (let r in out) {
+		if (a.grouped && r.section != last) {
+			if (last != "")
+				print("\n");
+			print("# " + r.section + "\n");
+			last = r.section;
+		}
+		print(r.link + "\n");
+	}
+	return 0;
+}
+
 function cmd_status() {
 	let raw = fs.readfile(STATE);
 	let st = null;
@@ -1044,6 +1311,8 @@ if (cmd == "convert") {
 	exit(cmd_apply(parse_args(ARGV)));
 } else if (cmd == "list_servers") {
 	exit(cmd_list_servers());
+} else if (cmd == "links") {
+	exit(cmd_links(ARGV));
 } else if (cmd == "fetch_cmd") {
 	exit(cmd_fetch_cmd(ARGV[1]));
 } else if (cmd == "status") {
@@ -1053,6 +1322,6 @@ if (cmd == "convert") {
 } else if (cmd == "diag") {
 	exit(cmd_diag(ARGV));
 } else {
-	print("usage: shoulderkop <convert|update|apply|list_servers|status|schedule|diag> [--rebuild] [--url=..] [--mode=lte|wifi] [--interval=1h] [--urltest=30s] [--schedule=0|1] [--yt-lists=youtube] [--eu-lists=russia_inside,telegram] [off]");
+	print("usage: shoulderkop <convert|update|apply|list_servers|links|status|schedule|diag> [--rebuild] [--url=..] [--mode=lte|wifi] [--interval=1h] [--urltest=30s] [--schedule=0|1] [--yt-lists=youtube] [--eu-lists=russia_inside,telegram] [--section=yt|eu|lte] [--file=..] [--json] [--grouped] [--podkop] [off]");
 	exit(2);
 }

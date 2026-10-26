@@ -29,8 +29,12 @@ Xray JSON / список vless://
 | **Обход БС** (`lte`) | `skop_lte`, `skop_lte_direct` | весь LAN — в прокси; списки РКН (`geosite.srs`, `geoip.srs`) — напрямую; `fully_routed_ips` — LAN-подсеть + `127.0.0.1` |
 | **Домашний интернет** (`wifi`) | `skop_yt`, `skop_eu` | `yt` — все WiFi-серверы (YouTube); `eu` — WiFi-серверы без группы «Россия/YouTube» (Telegram, Meta, Cloudflare, Roblox и т.п.); остальное — напрямую |
 
-Серверы внутри секции объединяются в `urltest`-группу: podkop сам переключается на лучший,
-интервал проверки по умолчанию — 30 секунд.
+Секции `skop_yt` и `skop_eu` — это **urltest**-секции podkop: серверы лежат в
+`urltest_proxy_links`, podkop сам переключается на лучший, интервал проверки по
+умолчанию — 30 секунд. В WiFi-режиме обе секции всегда собираются как `urltest`
+со vless-ссылками, без одиночных `outbound` и без балансировщиков. `xhttp`-узлы
+отсеиваются жёстко: без `sing-box tools decode-link` podkop такие ссылки не
+разбирает. В LTE-режиме поведение прежнее, там `xhttp` остаётся.
 
 ## Установка
 
@@ -133,7 +137,19 @@ shoulderkop update            # скачать подписку, разложи�
 shoulderkop update --rebuild  # то же, но с пересозданием всех секций skop_*
 shoulderkop status            # последний отчёт, пауза и состояние сервисов
 shoulderkop list_servers      # серверы из кэша
+shoulderkop links             # outbounds подписки → vless:// ссылки
 shoulderkop convert FILE      # разобрать файл подписки: active / expired / empty
+```
+
+`links` — обратная операция к конвертеру. По умолчанию берёт узлы из кэша
+подписки и печатает ссылки для текущего режима; `--section=yt|eu|lte` оставляет
+одну секцию, `--file=SUB` читает файл подписки, `--json` добавляет имена узлов.
+С `--podkop` ссылки собираются из уже разложенных секций podkop (включая
+синтетические `urltest`-группы):
+
+```sh
+shoulderkop links --section=yt
+shoulderkop links --podkop --json
 ```
 
 Списки сообщества можно передать и из командной строки (для режима `wifi`):

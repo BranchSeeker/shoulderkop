@@ -3,18 +3,23 @@
 // Режимы:
 //   lte  → skop_lte (proxy, все LTE-узлы группой, fully_routed_ips = LAN + 127.0.0.1)
 //          skop_lte_direct (exclusion, rkn-списки .srs → direct)
-//   wifi → skop_yt (proxy, community_lists из wifi_yt_lists; по умолчанию youtube)
-//          skop_eu (proxy, community_lists из wifi_eu_lists; по умолчанию
+//   wifi → skop_yt (urltest, community_lists из wifi_yt_lists; по умолчанию youtube)
+//          skop_eu (urltest, community_lists из wifi_eu_lists; по умолчанию
 //                   russia_inside,telegram,meta,cloudflare,hodca,roblox)
+//          Обе секции — urltest_proxy_links со vless-ссылками, никаких
+//          outbound-секций и балансировщиков. xhttp-узлы отсеиваются: без
+//          `tools decode-link` podkop такие ссылки не разбирает.
 //          Списки сообщества редактируются в LuCI; пока опций в конфиге нет,
 //          действуют захардкоженные значения по умолчанию.
 //
 // Сервера в секции:
-//   - 1 узел       → одиночный outbound_json;
-//   - движок умеет → proxy_config_type=urltest + urltest_proxy_links (ссылки);
-//     tools decode-link
+//   - 1 узел       → одиночный outbound_json (кроме WiFi: там всегда urltest);
+//   - ссылки podkop умеет декодировать сама (vless tcp/ws/grpc, либо любой
+//     транспорт при наличии tools decode-link)
+//                  → proxy_config_type=urltest + urltest_proxy_links;
 //   - иначе        → «синтетическая группа»: дочерние секции skop_<режим>_NN
 //                    (outbound) + urltest-JSON на их теги <child>-out.
+//     Оба варианта — urltest, никаких балансировщиков.
 //
 // Всё, что начинается с `skop_`, считаем своим и удаляем, если оно больше не нужно.
 // Секцию без подходящих серверов НЕ создаём: пустой proxy-секции podkop не переварит
@@ -166,6 +171,32 @@ function transport_of(n) {
 		return "tcp";
 	let tr = n.outbound.transport;
 	return (type(tr) == "object") ? ("" + (tr.type || "tcp")) : "tcp";
+}
+
+// xhttp podkop без `tools decode-link` не разбирает. В WiFi-секциях такие узлы
+// отбрасываем жёстко: иначе urltest_proxy_links не собрать и секция уедет в
+// синтетическую группу из outbound-секций. LTE этим не трогаем.
+function is_xhttp_node(n) {
+	let t = lc(transport_of(n));
+	return t == "xhttp" || t == "splithttp";
+}
+
+// podkop сам декодирует vless-ссылки (tcp/ws/grpc) без tools.decode-link.
+// xhttp, http/h2 и httpupgrade он так не умеет — для них нужен decode-link
+// или синтетическая группа из outbound_json.
+const LINK_TRANSPORTS = { tcp: true, ws: true, grpc: true };
+
+function native_links_ok(nodes, decode_ok) {
+	if (decode_ok)
+		return true;
+
+	for (let n in nodes) {
+		if (n.link == null || n.link == "")
+			return false;
+		if (!LINK_TRANSPORTS[transport_of(n)])
+			return false;
+	}
+	return true;
 }
 
 // --- LAN-подсеть -----------------------------------------------------------
@@ -383,21 +414,26 @@ function plan(mode) {
 
 	if (mode == "wifi") {
 		let lists = wifi_lists();
+		// Обе WiFi-секции — urltest: podkop сам выбирает лучший сервер по задержке.
+		// xhttp отбрасываем жёстко: без decode-link podkop не умеет такие ссылки,
+		// и секция вместо urltest_proxy_links уехала бы в outbound-группу.
 		push(out, {
 			name: "skop_yt",
 			kind: "proxy",
+			urltest: true,
 			community: lists.yt,
 			select: function (n) {
-				return is_wifi(n);
+				return is_wifi(n) && !is_xhttp_node(n);
 			}
 		});
 		push(out, {
 			name: "skop_eu",
 			kind: "proxy",
+			urltest: true,
 			primary: true,
 			community: lists.eu,
 			select: function (n) {
-				return is_wifi(n) && !is_yt(n);
+				return is_wifi(n) && !is_yt(n) && !is_xhttp_node(n);
 			}
 		});
 		return out;
@@ -422,35 +458,79 @@ function plan(mode) {
 	return out;
 }
 
+// какие узлы попадут в proxy-секции режима — для `shoulderkop links`.
+// Повторяет отбор apply(): если в подписке нет меток LTE/WiFi, все узлы идут
+// в основную секцию режима.
+function plan_sections(mode, nodes) {
+	if (mode != "wifi")
+		mode = "lte";
+
+	let list = plan(mode);
+	let any_hit = false;
+	for (let d in list)
+		if (d.kind == "proxy" && d.select != null)
+			for (let n in nodes)
+				if (d.select(n)) {
+					any_hit = true;
+					break;
+				}
+
+	let out = [];
+	for (let d in list) {
+		if (d.kind != "proxy")
+			continue;
+
+		let matched = [];
+		if (d.select != null)
+			for (let n in nodes)
+				if (d.select(n))
+					push(matched, n);
+
+		if (length(matched) == 0 && d.primary && !any_hit)
+			matched = nodes;
+
+		if (length(matched) > 0)
+			push(out, { name: d.name, nodes: matched });
+	}
+	return out;
+}
+
 // --- запись серверов в секцию ---------------------------------------------
 
 // вернуть { mode, node?, count, children[], xhttp?, changed }
-function write_servers(p, cur, name, nodes, decode_ok, urltest_iv) {
+function write_servers(p, cur, name, nodes, decode_ok, urltest_iv, force_urltest) {
 	let n = length(nodes);
 	let changed = 0;
 
-	if (n == 1) {
+	// Один узел обычно кладём одиночным outbound. Но WiFi-секции должны быть
+	// именно urltest-секциями, поэтому для них force_urltest=true и даже один
+	// сервер уходит в urltest_proxy_links (группа из одной ссылки).
+	if (n == 1 && !force_urltest) {
 		changed += want(p, cur, name, "proxy_config_type", "outbound");
 		changed += want(p, cur, name, "outbound_json", sprintf("%J", nodes[0].outbound));
 		changed += want(p, cur, name, "urltest_proxy_links", []);
 		return { mode: "outbound", node: nodes[0].name, count: 1, changed: changed };
 	}
 
-	if (decode_ok) {
+	if (native_links_ok(nodes, decode_ok)) {
 		let links = [];
-		let xhttp = 0;
 		for (let node in nodes) {
-			if (transport_of(node) == "xhttp")
-				xhttp++;
+			// xhttp в WiFi-секции отсеивается ещё в plan(); здесь страховка,
+			// чтобы в urltest_proxy_links не попала ссылка, которую podkop
+			// без tools.decode-link не разберёт.
+			if (is_xhttp_node(node))
+				continue;
 			push(links, node.link);
 		}
-		changed += want(p, cur, name, "proxy_config_type", "urltest");
-		changed += want(p, cur, name, "urltest_proxy_links", links);
-		changed += want(p, cur, name, "outbound_json", null);
-		changed += want(p, cur, name, "urltest_check_interval", urltest_iv);
-		changed += want(p, cur, name, "urltest_tolerance", "50");
-		changed += want(p, cur, name, "urltest_testing_url", "https://www.gstatic.com/generate_204");
-		return { mode: "urltest", count: n, xhttp: xhttp, changed: changed };
+		if (length(links) > 0) {
+			changed += want(p, cur, name, "proxy_config_type", "urltest");
+			changed += want(p, cur, name, "urltest_proxy_links", links);
+			changed += want(p, cur, name, "outbound_json", null);
+			changed += want(p, cur, name, "urltest_check_interval", urltest_iv);
+			changed += want(p, cur, name, "urltest_tolerance", "50");
+			changed += want(p, cur, name, "urltest_testing_url", "https://www.gstatic.com/generate_204");
+			return { mode: "urltest", count: length(links), changed: changed };
+		}
 	}
 
 	// синтетическая группа: дочерние секции + urltest-JSON на их теги
@@ -684,7 +764,7 @@ function apply(nodes) {
 		else
 			changed += want(p, cur, sec, "fully_routed_ips", []);
 
-		let r = write_servers(p, cur, sec, matched, decode_ok, urltest_iv);
+		let r = write_servers(p, cur, sec, matched, decode_ok, urltest_iv, desc.urltest == true);
 		changed += r.changed;
 		for (let c in (r.children || []))
 			keep[c] = true;
@@ -717,4 +797,5 @@ function apply(nodes) {
 	};
 }
 
-return { apply: apply, lan_cidr: lan_cidr, engine_decode_link: engine_decode_link };
+return { apply: apply, lan_cidr: lan_cidr, engine_decode_link: engine_decode_link,
+	plan_sections: plan_sections };
