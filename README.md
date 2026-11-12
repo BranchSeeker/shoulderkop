@@ -108,12 +108,17 @@ shoulderkop lists --force
 В LuCI есть галочка «Автообновление shoulderkop» (по умолчанию выключена). Когда
 она включена, cron раз в сутки проверяет GitHub Releases и ставит версию новее
 установленной; пакеты сверяются по `SHA256SUMS`, при ошибке остаётся рабочая
-версия. Вручную:
+версия. Вручную, по SSH:
 
 ```sh
-shoulderkop self-update --check   # только проверить
-shoulderkop self-update           # обновить, если есть новее
+shoulderkop upgrade            # проверить и поставить новую версию, если есть
+shoulderkop upgrade --check    # только проверить, ничего не ставить
+shoulderkop upgrade --force    # переустановить текущую версию
 ```
+
+`self-update` — прежнее имя той же команды (его использует cron), обе формы
+работают одинаково. Имя `update` занято обновлением подписки, поэтому апгрейд
+пакета называется `upgrade`.
 
 ## Если подписка истекла
 
@@ -189,7 +194,7 @@ shoulderkop list_servers      # серверы из кэша
 shoulderkop links             # outbounds подписки → vless:// ссылки
 shoulderkop convert FILE      # разобрать файл подписки: active / expired / empty
 shoulderkop lists [--force]   # локальный кэш белых списков РКН (LTE)
-shoulderkop self-update [--check]  # проверить и поставить новую версию
+shoulderkop upgrade [--check] # обновить сам пакет с GitHub Releases
 ```
 
 `links` — обратная операция к конвертеру. По умолчанию берёт узлы из кэша

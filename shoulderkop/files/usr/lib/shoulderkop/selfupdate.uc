@@ -363,7 +363,6 @@ function run(opts) {
 	opts = opts || {};
 	let check_only = (opts.check == true);
 	let force = (opts.force == true);
-	let quiet_out = (opts.quiet == true);
 
 	let current = installed_version();
 	let latest = latest_release();
@@ -371,6 +370,7 @@ function run(opts) {
 	let result = {
 		status: "error",
 		current: current,
+		previous: current,
 		latest: "",
 		checked_at: now,
 		updated: false,
@@ -480,10 +480,7 @@ function run(opts) {
 	quiet("rm -rf " + dir);
 	write_state(result);
 
-	if (!quiet_out) {
-		if (result.status == "updated")
-			print("shoulderkop обновлён: " + current + " → " + result.current + "\n");
-	}
+	// Вывод делает CLI: ручной запуск печатает отчёт сам, cron — только в лог.
 	return result;
 }
 

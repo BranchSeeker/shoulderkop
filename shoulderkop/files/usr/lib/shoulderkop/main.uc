@@ -1204,7 +1204,10 @@ function cmd_status() {
 	return 0;
 }
 
-// Автообновление пакета: --check только проверяет, --force переустанавливает.
+// Обновление пакета вручную: `shoulderkop upgrade` (короткая команда для SSH)
+// и прежнее `self-update` — одна и та же функция. `update` занято обновлением
+// подписки, поэтому апгрейд пакета называется upgrade.
+// --check только проверяет, --force переустанавливает.
 function cmd_selfupdate(argv) {
 	let o = { check: false, force: false, quiet: false, json: false };
 	for (let i = 1; i < length(argv); i++) {
@@ -1216,6 +1219,13 @@ function cmd_selfupdate(argv) {
 			o.quiet = true;
 		else if (argv[i] == "--json")
 			o.json = true;
+	}
+
+	// По SSH 10–20 секунд тишины выглядят как зависание.
+	if (!o.json && !o.quiet) {
+		let cur = selfupd.installed_version();
+		print(((cur == "") ? "shoulderkop" : "shoulderkop " + cur) +
+			": проверяю обновления на GitHub…\n");
 	}
 
 	let r = selfupd.run(o);
@@ -1231,15 +1241,16 @@ function cmd_selfupdate(argv) {
 	}
 
 	if (r.status == "error")
-		print("автообновление: ошибка — " + join("; ", r.errors || []) + "\n");
+		print("обновление: ошибка — " + join("; ", r.errors || []) + "\n");
 	else if (r.status == "latest")
-		print("автообновление: установлена последняя версия " + r.current + "\n");
+		print("обновление: установлена последняя версия " + r.current + "\n");
 	else if (r.status == "available")
-		print("автообновление: доступна " + r.latest + " (установлена " + r.current + ")\n");
+		print("обновление: доступна " + r.latest + " (установлена " + r.current +
+			")\nпоставить: shoulderkop upgrade\n");
 	else if (r.status == "busy")
-		print("автообновление: уже идёт другой запуск\n");
+		print("обновление: уже идёт другой запуск — подождите и повторите\n");
 	else if (r.status == "updated")
-		print("автообновление: обновлено " + r.current + " → " + r.latest + "\n");
+		print("обновление: " + r.previous + " → " + r.current + "\n");
 	else
 		print(sprintf("%J", r) + "\n");
 	return (r.status == "error") ? 1 : 0;
@@ -1432,9 +1443,9 @@ if (cmd == "convert") {
 	exit(cmd_diag(ARGV));
 } else if (cmd == "lists") {
 	exit(cmd_lists(ARGV));
-} else if (cmd == "self-update") {
+} else if (cmd == "upgrade" || cmd == "selfupdate" || cmd == "self-update") {
 	exit(cmd_selfupdate(ARGV));
 } else {
-	print("usage: shoulderkop <convert|update|apply|list_servers|links|status|schedule|diag|lists|self-update> [--rebuild] [--url=..] [--mode=lte|wifi] [--interval=1h] [--urltest=30s] [--schedule=0|1] [--yt-lists=youtube] [--eu-lists=russia_inside,telegram] [--section=yt|eu|lte] [--file=..] [--json] [--grouped] [--podkop] [--force] [off]");
+	print("usage: shoulderkop <convert|update|apply|list_servers|links|status|schedule|diag|lists|upgrade|self-update> [--rebuild] [--url=..] [--mode=lte|wifi] [--interval=1h] [--urltest=30s] [--schedule=0|1] [--yt-lists=youtube] [--eu-lists=russia_inside,telegram] [--section=yt|eu|lte] [--file=..] [--json] [--grouped] [--podkop] [--force] [off]");
 	exit(2);
 }
