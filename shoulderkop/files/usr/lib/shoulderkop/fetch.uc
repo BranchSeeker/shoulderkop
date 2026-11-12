@@ -69,6 +69,24 @@ function is_ipv4(s) {
 	return true;
 }
 
+// приватные адреса уже покрыты localv4; добавлять/удалять их нельзя —
+// удаление адреса из диапазона разрезает диапазон и оставляет дыру
+function is_private_ipv4(s) {
+	let p = split("" + s, ".");
+	if (length(p) != 4)
+		return false;
+	let a = int(p[0]), b = int(p[1]);
+	if (a == 0 || a == 10 || a == 127)
+		return true;
+	if (a == 169 && b == 254)
+		return true;
+	if (a == 172 && b >= 16 && b <= 31)
+		return true;
+	if (a == 192 && b == 168)
+		return true;
+	return false;
+}
+
 function uniq(list) {
 	let out = [];
 	let seen = {};
@@ -193,7 +211,7 @@ function nft_bypass(ips, add) {
 	if (length(ips) == 0 || !podkop_table())
 		return;
 	for (let ip in ips) {
-		if (!is_ipv4(ip))
+		if (!is_ipv4(ip) || is_private_ipv4(ip))
 			continue;
 		if (add)
 			quiet("nft add element inet PodkopTable localv4 { " + ip + " }");
@@ -291,6 +309,7 @@ function attempt(url, opts, mode, timeout) {
 		ip = resolve(host);
 		if (ip != "") {
 			push(bypass, ip);
+			nft_bypass([ ip ], true);
 			extra += " -4 --resolve '" + host + ":" + hp.port + ":" + ip + "'";
 		}
 
@@ -383,6 +402,7 @@ function fetch_to_file(url, dest, opts) {
 				ip = resolve(hp.host);
 				if (ip != "") {
 					push(bypass, ip);
+					nft_bypass([ ip ], true);
 					extra += " -4 --resolve '" + hp.host + ":" + hp.port + ":" + ip + "'";
 				}
 				if (info.src != "")
