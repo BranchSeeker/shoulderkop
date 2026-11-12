@@ -216,17 +216,31 @@ function latest_release() {
 	let hr = fetchmod.fetch(HTML_LATEST, { ua: UA, proxy: true });
 	let tag = "";
 	let marker = "/releases/tag/";
-	let p = index(hr.body, marker);
-	if (p >= 0) {
-		let rest = substr(hr.body, p + length(marker));
+	let off = 0;
+	while (true) {
+		let p = index(substr(hr.body, off), marker);
+		if (p < 0)
+			break;
+		let abs = off + p + length(marker);
+		let rest = substr(hr.body, abs);
 		let q = index(rest, "\"");
 		let q2 = index(rest, "'");
 		if (q < 0 || (q2 >= 0 && q2 < q))
 			q = q2;
 		if (q < 0)
 			q = index(rest, " ");
-		if (q > 0)
-			tag = trim(substr(rest, 0, q));
+		if (q > 0) {
+			let cand = trim(substr(rest, 0, q));
+			// в HTML есть шаблон /releases/tag/*name — берём только vX.Y.Z
+			if (substr(cand, 0, 1) == "v") {
+				let c2 = ord(substr(cand, 1, 1));
+				if (c2 >= 0x30 && c2 <= 0x39) {
+					tag = cand;
+					break;
+				}
+			}
+		}
+		off = abs;
 	}
 	if (tag == "")
 		return { ok: false, tag: "", assets: [], via: hr.via,
@@ -279,7 +293,7 @@ function verify_sums(dir, files, sums_asset) {
 	let path = dir + "/SHA256SUMS";
 	let r = fetchmod.fetch_to_file(sums_asset.url, path, { ua: UA, fast: true, proxy: true });
 	if (!r.ok) {
-		errors.push("SHA256SUMS не скачался (HTTP " + r.http + ")");
+		push(errors, "SHA256SUMS не скачался (HTTP " + r.http + ")");
 		return { ok: false, errors: errors };
 	}
 
@@ -301,16 +315,16 @@ function verify_sums(dir, files, sums_asset) {
 
 	for (let f in files) {
 		if (want[f.name] == null) {
-			errors.push("нет хэша для " + f.name);
+			push(errors, "нет хэша для " + f.name);
 			continue;
 		}
 		let got = sha256(dir + "/" + f.name);
 		if (got == "") {
-			errors.push("sha256sum недоступен — " + f.name + " не проверен");
+			push(errors, "sha256sum недоступен — " + f.name + " не проверен");
 			continue;
 		}
 		if (lc(got) != lc(want[f.name]))
-			errors.push("хэш не совпал: " + f.name);
+			push(errors, "хэш не совпал: " + f.name);
 	}
 	return { ok: length(errors) == 0, errors: errors };
 }
@@ -366,7 +380,7 @@ function run(opts) {
 	};
 
 	if (!latest.ok) {
-		result.errors.push(latest.error);
+		push(result.errors, latest.error);
 		write_state(result);
 		return result;
 	}
@@ -376,14 +390,14 @@ function run(opts) {
 
 	let mgr = pkg_manager();
 	if (mgr == "") {
-		result.errors.push("не найден apk/opkg");
+		push(result.errors, "не найден apk/opkg");
 		write_state(result);
 		return result;
 	}
 	let ext = (mgr == "apk") ? "apk" : "ipk";
 	let picked = pick_assets(latest.assets, ext);
 	if (picked.main == null) {
-		result.errors.push("в релизе " + latest.tag + " нет пакета shoulderkop." + ext);
+		push(result.errors, "в релизе " + latest.tag + " нет пакета shoulderkop." + ext);
 		write_state(result);
 		return result;
 	}
@@ -402,7 +416,7 @@ function run(opts) {
 
 	if (!lock_acquire()) {
 		result.status = "busy";
-		result.errors.push("другое обновление уже идёт");
+		push(result.errors, "другое обновление уже идёт");
 		write_state(result);
 		return result;
 	}
@@ -419,7 +433,7 @@ function run(opts) {
 		let dest = dir + "/" + f.name;
 		let r = fetchmod.fetch_to_file(f.url, dest, { ua: UA, proxy: true });
 		if (!r.ok) {
-			result.errors.push("не скачался " + f.name + " (HTTP " + r.http + ")");
+			push(result.errors, "не скачался " + f.name + " (HTTP " + r.http + ")");
 			lock_release();
 			write_state(result);
 			return result;
@@ -431,7 +445,7 @@ function run(opts) {
 	for (let e in sums.errors)
 		push(result.errors, e);
 	if (!sums.ok) {
-		result.errors.push("проверка SHA256SUMS не прошла — обновление отменено");
+		push(result.errors, "проверка SHA256SUMS не прошла — обновление отменено");
 		lock_release();
 		write_state(result);
 		return result;
@@ -441,7 +455,7 @@ function run(opts) {
 	install_file(dir + "/" + picked.main.name, mgr);
 	let after = installed_version();
 	if (ver_cmp(after, result.latest) < 0) {
-		result.errors.push("пакет shoulderkop не установился — смотрите " + LOG);
+		push(result.errors, "пакет shoulderkop не установился — смотрите " + LOG);
 		lock_release();
 		write_state(result);
 		return result;
@@ -449,7 +463,7 @@ function run(opts) {
 
 	if (picked.luci != null) {
 		if (!install_file(dir + "/" + picked.luci.name, mgr))
-			result.errors.push("luci-app-shoulderkop не установился — CLI обновлён");
+			push(result.errors, "luci-app-shoulderkop не установился — CLI обновлён");
 	}
 
 	result.status = "updated";
