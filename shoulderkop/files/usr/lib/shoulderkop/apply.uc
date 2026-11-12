@@ -29,6 +29,7 @@
 
 let fs = require("fs");
 let uci = require("uci");
+let lists = require("lists");
 
 const GEOSITE = "https://github.com/BranchSeeker/rkn-whitelist-srs/releases/latest/download/geosite.srs";
 const GEOIP = "https://github.com/BranchSeeker/rkn-whitelist-srs/releases/latest/download/geoip.srs";
@@ -355,6 +356,22 @@ function want(p, cur, sec, opt, value) {
 	if (have != null && "" + have == "" + value)
 		return 0;
 	p.set("podkop", sec, opt, "" + value);
+	return 1;
+}
+
+// скалярная опция в podkop.settings (snapshot() хранит только section, не
+// settings, поэтому для настроек читаем значение напрямую)
+function want_settings(p, opt, value) {
+	let have = p.get("podkop", "settings", opt);
+	if (value == null || value == "") {
+		if (have == null || have == "")
+			return 0;
+		p.delete("podkop", "settings", opt);
+		return 1;
+	}
+	if (have != null && "" + have == "" + value)
+		return 0;
+	p.set("podkop", "settings", opt, "" + value);
 	return 1;
 }
 
@@ -692,6 +709,7 @@ function apply(nodes) {
 	let keep = {};
 	let changed = auto_changed;
 	let cidr = null;
+	let local_http = false;
 	let any_hit = false;
 	if (length(nodes) > 0)
 		for (let d in plan_list)
@@ -739,12 +757,58 @@ function apply(nodes) {
 		changed += want(p, cur, sec, "connection_type", desc.kind);
 
 		if (desc.kind == "exclusion") {
-			changed += want(p, cur, sec, "remote_domain_lists", desc.remote_domain || []);
-			changed += want(p, cur, sec, "remote_subnet_lists", desc.remote_subnet || []);
+			// Локальный кэш списков, если он уже скачан: podkop не ходит на
+			// GitHub при каждом reload. Нет файлов — прежние remote-ссылки.
+			let lf = lists.local_files();
+			let hu = lists.http_urls();
+			let local_domain = [];
+			let local_subnet = [];
+			let remote_domain = [];
+			let remote_subnet = [];
+			let dom_kind = "remote";
+			let sub_kind = "remote";
+
+			// 1) локальный HTTP (.srs через uhttpd) — быстро, без разбора;
+			// 2) локальный plain-файл — работает без uhttpd, но медленно;
+			// 3) remote GitHub — как раньше.
+			if (hu != null && hu.domain != null) {
+				remote_domain = [ hu.domain ];
+				dom_kind = "http";
+			}
+			else if (lf.domain != null) {
+				local_domain = [ lf.domain ];
+				dom_kind = "local";
+			}
+			else {
+				remote_domain = desc.remote_domain || [];
+			}
+
+			if (hu != null && hu.subnet != null) {
+				remote_subnet = [ hu.subnet ];
+				sub_kind = "http";
+			}
+			else if (lf.subnet != null) {
+				local_subnet = [ lf.subnet ];
+				sub_kind = "local";
+			}
+			else {
+				remote_subnet = desc.remote_subnet || [];
+			}
+			if (dom_kind == "http" || sub_kind == "http")
+				local_http = true;
+			changed += want(p, cur, sec, "local_domain_lists", local_domain);
+			changed += want(p, cur, sec, "local_subnet_lists", local_subnet);
+			changed += want(p, cur, sec, "remote_domain_lists", remote_domain);
+			changed += want(p, cur, sec, "remote_subnet_lists", remote_subnet);
 			push(report, {
 				section: sec,
 				kind: "exclusion",
-				lists: length(desc.remote_domain || []) + length(desc.remote_subnet || [])
+				lists: length(local_domain) + length(local_subnet) +
+					length(remote_domain) + length(remote_subnet),
+				source: (dom_kind == "http" || sub_kind == "http") ? "http" :
+					((dom_kind == "local" || sub_kind == "local") ? "local" : "remote"),
+				domains: lf.domain_count,
+				subnets: lf.subnet_count
 			});
 			continue;
 		}
@@ -771,6 +835,29 @@ function apply(nodes) {
 		r.section = sec;
 		r.kind = "proxy";
 		push(report, r);
+	}
+
+	// LTE: podkop сам скачивает white-list .srs при reload. В LTE GitHub
+	// напрямую недоступен, поэтому просим podkop качать списки через туннель
+	// (mixed inbound 127.0.0.1:4534 на секцию skop_lte). Тем же входом
+	// пользуется lists.uc, когда кэширует списки локально.
+	let lte_nodes = 0;
+	for (let r in report)
+		if (r.section == "skop_lte" && r.kind == "proxy")
+			lte_nodes = int("" + (r.count || 0));
+	if (mode == "lte" && lte_nodes > 0 && !local_http) {
+		changed += want_settings(p, "download_lists_via_proxy", "1");
+		changed += want_settings(p, "download_lists_via_proxy_section", "skop_lte");
+	}
+	else {
+		// WiFi или LTE без серверов. Свой mixed proxy на skop_lte убираем:
+		// иначе podkop останется с настройкой на несуществующую секцию.
+		// Чужую настройку пользователя (другая секция) не трогаем.
+		let cur_sec = "" + (p.get("podkop", "settings", "download_lists_via_proxy_section") || "");
+		if (mode == "lte" || cur_sec == "skop_lte") {
+			changed += want_settings(p, "download_lists_via_proxy", "0");
+			changed += want_settings(p, "download_lists_via_proxy_section", null);
+		}
 	}
 
 	let removed = cleanup(p, cur, keep);

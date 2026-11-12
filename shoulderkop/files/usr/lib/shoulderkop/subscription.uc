@@ -39,6 +39,70 @@ function real_outbounds(config) {
 	return result;
 }
 
+// Имя узла в балансере. Remnawave отдаёт хост-балансер одним клиентским
+// конфигом с несколькими outbound'ами: первый тег пустой/`proxy` (имя бралось
+// из remarks), остальные — `proxy-2`, `proxy-3`… В podkop такие серверы
+// выглядели как «Хост», «proxy-2». Даём всем имя хоста с номером:
+// «Хост (1)», «Хост (2)». Одиночный сервер не трогаем — там всё уже работало.
+function name_balancer_nodes(config, accepted) {
+	if (length(accepted) < 2)
+		return;
+
+	let base = convert.group_name(config);
+	if (base == "" || base == "proxy" || base == "proxy-out")
+		return;
+
+	for (let i = 0; i < length(accepted); i++)
+		accepted[i].tag = base + " (" + (i + 1) + ")";
+}
+
+// Второй случай: панель отдаёт по конфигу на сервер, но remarks у всех
+// серверов одного хоста одинаковый, а теги — `proxy-2`, `proxy-3`. Тогда
+// несколько конфигов выглядят как один балансер. Переименовываем группу,
+// только если в ней есть «proxy-N» или повторяющиеся имена: группы с
+// осмысленными именами (Германия, Нидерланды…) не трогаем.
+function name_balancer_groups(nodes) {
+	let groups = {};
+	let order = [];
+
+	for (let n in nodes) {
+		let g = "" + (n.group || "");
+		if (g == "")
+			continue;
+		if (groups[g] == null) {
+			groups[g] = [];
+			push(order, g);
+		}
+		push(groups[g], n);
+	}
+
+	for (let g in order) {
+		let list = groups[g];
+		if (length(list) < 2)
+			continue;
+
+		let need = false;
+		let names = {};
+		for (let n in list) {
+			let nm = "" + (n.name || "");
+			if (names[nm])
+				need = true;
+			names[nm] = true;
+			if (match(nm, /^proxy(-[0-9]+)?$/) != null)
+				need = true;
+		}
+		if (!need)
+			continue;
+
+		for (let i = 0; i < length(list); i++) {
+			let n = list[i];
+			n.name = g + " (" + (i + 1) + ")";
+			n.outbound.tag = n.name;
+			n.link = convert.build_link(n.outbound);
+		}
+	}
+}
+
 function parse_xray_json(text, allow_xhttp) {
 	if (allow_xhttp == null)
 		allow_xhttp = true;
@@ -52,6 +116,11 @@ function parse_xray_json(text, allow_xhttp) {
 	for (let c in configs) {
 		if (!is_xray_config(c))
 			continue;
+
+		// сначала собираем все пригодные outbound'ы одного конфига, чтобы
+		// понять, балансер это или одиночный хост
+		let accepted = [];
+		let local_seen = {};
 		for (let o in real_outbounds(c)) {
 			// пометка неподдерживаемого xhttp (обфускация, как в steer)
 			let ss = (type(o.streamSettings) == "object") ? o.streamSettings : {};
@@ -86,6 +155,18 @@ function parse_xray_json(text, allow_xhttp) {
 				continue;
 			}
 			let id = convert.outbound_identity(ob);
+			if (local_seen[id])
+				continue;
+			local_seen[id] = true;
+			push(accepted, { outbound: ob, o: o, tag: ob.tag });
+		}
+
+		name_balancer_nodes(c, accepted);
+
+		for (let a in accepted) {
+			let ob = a.outbound;
+			ob.tag = a.tag;
+			let id = convert.outbound_identity(ob);
 			if (seen[id])
 				continue;
 			seen[id] = true;
@@ -97,6 +178,8 @@ function parse_xray_json(text, allow_xhttp) {
 			});
 		}
 	}
+
+	name_balancer_groups(nodes);
 	return { nodes: nodes, skipped: skipped };
 }
 

@@ -69,4 +69,4 @@ wget -O /tmp/sk-install.sh https://raw.githubusercontent.com/BranchSeeker/should
 собранные как побочный эффект, и в релиз они попадать не должны.
 
 Перед тегом поднимите `PKG_VERSION`/`PKG_RELEASE` в обоих `Makefile`, затем
-`git tag v0.4.1 && git push origin v0.4.1`.
+`git tag v0.5.0 && git push origin v0.5.0`.

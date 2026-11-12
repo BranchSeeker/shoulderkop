@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=shoulderkop
-PKG_VERSION:=0.4.7
+PKG_VERSION:=0.5.0
 PKG_RELEASE:=1
 
 PKG_LICENSE:=MIT
@@ -71,6 +71,7 @@ define Package/shoulderkop/install
 	$(INSTALL_BIN)  ./files/usr/bin/shoulderkop $(1)/usr/bin/shoulderkop
 	$(INSTALL_BIN)  ./files/etc/hotplug.d/iface/99-shoulderkop $(1)/etc/hotplug.d/iface/99-shoulderkop
 	$(INSTALL_DATA) ./files/usr/lib/shoulderkop/*.uc $(1)/usr/lib/shoulderkop/
+	echo "$(PKG_VERSION)-r$(PKG_RELEASE)" > $(1)/usr/lib/shoulderkop/version
 endef
 
 $(eval $(call BuildPackage,shoulderkop))

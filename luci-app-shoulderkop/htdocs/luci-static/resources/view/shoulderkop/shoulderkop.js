@@ -495,6 +495,8 @@ function updateArgs(ctx, rebuild) {
 	args.push('--interval=' + (ctx.interval.formvalue(SETTINGS) || '30m'));
 	args.push('--urltest=' + (ctx.urltest.formvalue(SETTINGS) || '30s'));
 	args.push('--schedule=' + flagValue(ctx.sched.formvalue(SETTINGS)));
+	if (ctx.autoUpdate)
+		args.push('--auto-update=' + flagValue(ctx.autoUpdate.formvalue(SETTINGS)));
 
 	// Свои списки сообщества передаём только для WiFi: в LTE секции свои,
 	// а сохранённые значения не трогаем, чтобы они пережили переключение режима.
@@ -512,7 +514,8 @@ function appliedLine(a) {
 	if (a.error)
 		return E('li', {}, (a.section || '?') + ': ' + _('ошибка: ') + a.error);
 	if (a.kind === 'exclusion')
-		return E('li', {}, a.section + ': ' + _('списки → напрямую') + ' (' + (a.lists || 0) + ')');
+		return E('li', {}, a.section + ': ' + _('списки → напрямую') + ' (' + (a.lists || 0) + ')' +
+			(a.source === 'http' ? ' · ' + _('локально') : ''));
 	if (a.mode === 'group')
 		return E('li', {}, a.section + ': ' + _('группа из ') + (a.children ? a.children.length : 0) + _(' серверов'));
 	if (a.mode === 'urltest')
@@ -706,6 +709,31 @@ function statusNodes(st) {
 		var svc = serviceText(st.services);
 		if (svc)
 			out.push(E('p', {}, [ E('strong', {}, _('Сервисы: ')), svc ]));
+	}
+
+	if (st.lists && (st.lists.domain_count || st.lists.subnet_count)) {
+		var lst = _('Белые списки: ') + (st.lists.domain_count || 0) + ' ' + _('доменов') + ', ' +
+			(st.lists.subnet_count || 0) + ' ' + _('подсетей');
+		if (st.lists.http_domain)
+			lst += ' · ' + _('локально');
+		out.push(E('p', {}, lst));
+	}
+
+	if (st.self_update) {
+		var su = st.self_update;
+		var line = _('Версия shoulderkop: ') + (su.current || '—');
+		if (su.enabled)
+			line += ' · ' + _('автообновление включено');
+		out.push(E('p', {}, line));
+		if (su.last && su.last.checked_at) {
+			var ls = su.last.status || '';
+			var lt = (ls === 'updated') ? _('обновлено до ') + (su.last.current || '')
+				: (ls === 'latest') ? _('последняя версия')
+				: (ls === 'available') ? _('доступна ') + (su.last.latest || '')
+				: (ls === 'error') ? _('ошибка: ') + ((su.last.errors || []).join('; '))
+				: ls;
+			out.push(E('p', {}, _('Автообновление: ') + fmtDate(su.last.checked_at) + ' — ' + lt));
+		}
 	}
 
 	var lines = (st.applied || []).map(appliedLine).filter(function (x) { return x != null; });
@@ -931,6 +959,11 @@ return view.extend({
 			_('Поставить cron-задание, которое обновляет подписку.'));
 		o.default = '1';
 		ctx.sched = o;
+
+		o = s.option(form.Flag, 'auto_update', _('Автообновление shoulderkop'),
+			_('Раз в сутки проверять GitHub Releases и ставить новую версию пакета. По умолчанию выключено.'));
+		o.default = '0';
+		ctx.autoUpdate = o;
 
 		o = s.option(form.Flag, 'diag_enabled', _('Проверять сеть и чинить'),
 			_('Раз в несколько минут проверять интернет и при поломке возвращать автозапуск podkop, перезапускать его, переключать DNS, а при мёртвых узлах переводить всё в direct.'));

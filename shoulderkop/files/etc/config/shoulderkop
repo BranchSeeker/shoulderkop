@@ -17,6 +17,11 @@ config settings 'settings'
 	option urltest_interval '30s'
 	option enable_schedule '1'
 
+	# Автообновление пакета shoulderkop с GitHub Releases. По умолчанию
+	# выключено: ставим только версию новее установленной, с проверкой
+	# SHA256SUMS и откатом на прежнюю при любой ошибке.
+	option auto_update '0'
+
 	# Сетевая диагностика: раз в 5 минут проверяем интернет (gstatic) и, если
 	# что-то сломалось, чиним — автозапуск podkop, перезапуск, DNS-лестница,
 	# при полном отсутствии живых узлов — всё в direct.

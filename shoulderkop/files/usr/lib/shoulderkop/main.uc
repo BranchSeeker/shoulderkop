@@ -16,9 +16,12 @@ let fs = require("fs");
 let uci = require("uci");
 let subscription = require("subscription");
 let convert = require("convert");
+let fetchmod = require("fetch");
+let listsmod = require("lists");
 let applymod = require("apply");
 let lifecycle = require("lifecycle");
 let diagmod = require("diag");
+let selfupd = require("selfupdate");
 
 const CACHE = "/tmp/shoulderkop.cache.json";
 const STATE = "/tmp/shoulderkop.state.json";
@@ -176,6 +179,12 @@ function migrate_settings() {
 		changed = true;
 	}
 
+	// Автообновление пакета. По умолчанию выключено: обновление меняет
+	// установленную версию, это должно быть осознанным выбором.
+	if (c.get("shoulderkop", "settings", "auto_update") == null) {
+		c.set("shoulderkop", "settings", "auto_update", "0");
+		changed = true;
+	}
 
 	// Пауза туннеля при истёкшей подписке. 0 — обычный режим.
 	if (c.get("shoulderkop", "settings", "suspended") == null) {
@@ -280,31 +289,17 @@ function fetch_headers(hwid) {
 	];
 }
 
-// Один HTTP-запрос: тело и заголовки — в отдельные файлы, код ответа — в stdout.
-// sh() пишет stdout команды в свой tmp, поэтому код читаем оттуда.
+// Один HTTP-запрос через fetch.uc. Он сам перебирает обычный и прямой путь
+// (WAN + DNS провайдера + обход nft-метки podkop), поэтому подписка
+// обновляется, даже когда туннель поднят, но все серверы мертвы.
 function fetch_one(url, ua, hwid) {
-	sh_seq++;
-	let base = "/tmp/.shoulderkop.fetch." + own_pid() + "." + sh_seq;
-	let bodyf = base + ".body";
-	let headf = base + ".head";
-
-	let cmd = "curl -s -L -m 30 -A '" + hdr_val(ua) + "'";
-	for (let h in fetch_headers(hwid))
-		if (hdr_val(h[1]) != "")
-			cmd += " -H '" + h[0] + ": " + hdr_val(h[1]) + "'";
-	cmd += " -D " + headf + " -o " + bodyf + " -w '%{http_code}' '" + url + "'";
-
-	let raw_code = trim(sh(cmd));
-	let code = (raw_code == "") ? 0 : int(raw_code);
-	let body = fs.readfile(bodyf);
-	let head = fs.readfile(headf);
-	try { fs.unlink(bodyf); } catch (e) {}
-	try { fs.unlink(headf); } catch (e) {}
-
+	let r = fetchmod.fetch(url, { ua: ua, headers: fetch_headers(hwid), proxy: true });
 	return {
-		http: code,
-		body: (body == null) ? "" : body,
-		headers: (head == null) ? "" : head
+		http: r.http,
+		body: r.body,
+		headers: r.headers,
+		via: r.via,
+		ip: r.ip
 	};
 }
 
@@ -348,14 +343,15 @@ function fetch_nodes() {
 			if (ui.present)
 				expired_userinfo = ui;
 			push(checked, { url: url, http: res.http, status: "expired",
-				reason: "HTTP " + res.http, expire: ui.expire });
+				reason: "HTTP " + res.http, expire: ui.expire, via: res.via });
 			continue;
 		}
 
 		if (res.http == 0) {
 			failed++;
 			push(errors, "request failed: " + url);
-			push(checked, { url: url, http: 0, status: "error", reason: "request failed" });
+			push(checked, { url: url, http: 0, status: "error", reason: "request failed",
+				via: res.via });
 			continue;
 		}
 
@@ -363,7 +359,7 @@ function fetch_nodes() {
 			failed++;
 			push(errors, "HTTP " + res.http + ": " + url);
 			push(checked, { url: url, http: res.http, status: "error",
-				reason: "HTTP " + res.http });
+				reason: "HTTP " + res.http, via: res.via });
 			continue;
 		}
 
@@ -391,7 +387,7 @@ function fetch_nodes() {
 			if (cls.userinfo.present)
 				expired_userinfo = cls.userinfo;
 			push(checked, { url: url, http: res.http, status: "expired",
-				reason: cls.reason, expire: cls.userinfo.expire });
+				reason: cls.reason, expire: cls.userinfo.expire, via: res.via });
 			continue;
 		}
 
@@ -401,7 +397,7 @@ function fetch_nodes() {
 			for (let n in parsed.skipped)
 				push(errors, "skipped " + n.name + ": " + n.reason);
 			push(checked, { url: url, http: res.http, status: "error",
-				reason: cls.reason, expire: cls.userinfo.expire });
+				reason: cls.reason, expire: cls.userinfo.expire, via: res.via });
 			continue;
 		}
 
@@ -422,7 +418,7 @@ function fetch_nodes() {
 			failed++;
 			push(errors, "no usable nodes: " + url);
 			push(checked, { url: url, http: res.http, status: "error",
-				reason: "no usable nodes" });
+				reason: "no usable nodes", via: res.via });
 			continue;
 		}
 
@@ -431,7 +427,7 @@ function fetch_nodes() {
 		for (let n in parsed.skipped)
 			push(errors, "skipped " + n.name + ": " + n.reason);
 		push(checked, { url: url, http: res.http, status: "active",
-			reason: "", expire: cls.userinfo.expire });
+			reason: "", expire: cls.userinfo.expire, via: res.via });
 	}
 
 	if (attempted == 0)
@@ -554,6 +550,8 @@ function parse_args(argv) {
 			a.urltest = substr(v, 11);
 		else if (substr(v, 0, 11) == "--schedule=")
 			a.schedule = substr(v, 11);
+		else if (substr(v, 0, 14) == "--auto-update=")
+			a.auto_update = substr(v, 14);
 
 		else if (substr(v, 0, 11) == "--yt-lists=")
 			a.yt_lists = split_arg_list(substr(v, 11));
@@ -623,6 +621,7 @@ function save_settings(a) {
 	put("update_interval", a.interval);
 	put("urltest_interval", a.urltest);
 	put("enable_schedule", a.schedule);
+	put("auto_update", a.auto_update);
 	put_list("wifi_yt_lists", a.yt_lists);
 	put_list("wifi_eu_lists", a.eu_lists);
 
@@ -639,6 +638,18 @@ function cmd_update(a) {
 	let fetched = fetch_nodes();
 	let nodes = fetched.nodes;
 	let suspended = lifecycle.is_suspended();
+
+	// Белые списки РКН для LTE: скачиваем, пока подписка активна и сеть есть.
+	// Если GitHub недоступен, ничего не ломаем — apply возьмёт старый кэш или
+	// прежние remote-ссылки.
+	let lists_result = null;
+	let lists_warn = "";
+	if (fetched.status == "active") {
+		lists_result = listsmod.sync(false);
+		if (!lists_result.ok && !lists_result.skipped)
+			lists_warn = "белые списки не обновлены: " +
+				join("; ", lists_result.errors || []);
+	}
 
 	// Сначала узнаём статус подписки — и только потом трогаем секции.
 	// При истёкшей/недоступной подписке старая раскладка остаётся на месте.
@@ -736,6 +747,29 @@ function cmd_update(a) {
 	result.suspended = false;
 	result.resumed = false;
 	result.rebuilt = (shrink && wiped > 0);
+
+	// Первый запуск в LTE: apply только что включил mixed proxy podkop.
+	// Пробуем ещё раз скачать списки уже через туннель и, если получилось,
+	// перекладываем секцию на локальные файлы (reload с локальными — быстрый).
+	if (lists_result != null && !lists_result.ok && !suspended &&
+	    uci_get("shoulderkop", "settings", "mode") == "lte") {
+		let lr2 = listsmod.sync(true);
+		if (lr2.ok) {
+			let r2 = apply_nodes(nodes, fetched.errors, fetched.warnings, { no_reload: suspended });
+			result = r2;
+			result.updated = time();
+			result.status = "active";
+			result.userinfo = fetched.userinfo;
+			result.checked = fetched.checked;
+			result.suspended = false;
+			result.resumed = false;
+			result.rebuilt = (shrink && wiped > 0);
+			lists_result = lr2;
+		}
+	}
+	result.lists = lists_result;
+	if (lists_warn != "" && (lists_result == null || !lists_result.ok))
+		push(result.warnings, lists_warn);
 
 	// запоминаем число активных подписок для следующего сравнения; при ошибке
 	// сети значение не трогаем, чтобы истёкшую ссылку не спутать с недоступной
@@ -1163,8 +1197,79 @@ function cmd_status() {
 		history_len: length(ds.history)
 	};
 
+	st.lists = listsmod.status();
+	st.self_update = selfupd.status();
+
 	print(sprintf("%J", st));
 	return 0;
+}
+
+// Автообновление пакета: --check только проверяет, --force переустанавливает.
+function cmd_selfupdate(argv) {
+	let o = { check: false, force: false, quiet: false, json: false };
+	for (let i = 1; i < length(argv); i++) {
+		if (argv[i] == "--check")
+			o.check = true;
+		else if (argv[i] == "--force")
+			o.force = true;
+		else if (argv[i] == "--quiet")
+			o.quiet = true;
+		else if (argv[i] == "--json")
+			o.json = true;
+	}
+
+	let r = selfupd.run(o);
+	if (o.json) {
+		print(sprintf("%J", r));
+		return (r.status == "error") ? 1 : 0;
+	}
+	if (o.quiet) {
+		if (r.status == "error")
+			system("logger -t shoulderkop 'self-update: " +
+				replace(join("; ", r.errors || []), "'", "") + "'");
+		return (r.status == "error") ? 1 : 0;
+	}
+
+	if (r.status == "error")
+		print("автообновление: ошибка — " + join("; ", r.errors || []) + "\n");
+	else if (r.status == "latest")
+		print("автообновление: установлена последняя версия " + r.current + "\n");
+	else if (r.status == "available")
+		print("автообновление: доступна " + r.latest + " (установлена " + r.current + ")\n");
+	else if (r.status == "busy")
+		print("автообновление: уже идёт другой запуск\n");
+	else if (r.status == "updated")
+		print("автообновление: обновлено " + r.current + " → " + r.latest + "\n");
+	else
+		print(sprintf("%J", r) + "\n");
+	return (r.status == "error") ? 1 : 0;
+}
+
+// Ручное обновление кэша белых списков (LTE). --force игнорирует суточный TTL.
+function cmd_lists(argv) {
+	let force = false;
+	let as_json = false;
+	for (let i = 1; i < length(argv); i++) {
+		if (argv[i] == "--force")
+			force = true;
+		else if (argv[i] == "--json")
+			as_json = true;
+	}
+
+	let r = listsmod.sync(force);
+	if (as_json) {
+		print(sprintf("%J", r));
+		return r.ok ? 0 : 1;
+	}
+
+	if (r.skipped)
+		print("списки: кэш свежий, обновление не нужно\n");
+	else if (r.ok)
+		print("списки: ok (" + r.source + "), доменов " + r.domain_count +
+			", подсетей " + r.subnet_count + "\n");
+	else
+		print("списки: не обновлены — " + join("; ", r.errors || []) + "\n");
+	return r.ok ? 0 : 1;
 }
 
 // cron-выражение под выбранный интервал (минуты разнесены, чтобы не все роутеры
@@ -1224,6 +1329,9 @@ function cmd_schedule(force_off) {
 	// диагностика живёт своей строкой: не блокирует обновление подписки
 	if (uci_get("shoulderkop", "settings", "diag_enabled") == "1" && !force_off)
 		push(keep, diag_cron_spec(uci_get("shoulderkop", "settings", "diag_interval")) + " " + DIAG_CRON_LINE);
+	// автообновление пакета — раз в сутки, только если включено в настройках
+	if (uci_get("shoulderkop", "settings", "auto_update") == "1" && !force_off)
+		push(keep, "17 4 * * * /usr/bin/shoulderkop self-update --quiet");
 
 	let body = (length(keep) > 0) ? join("\n", keep) + "\n" : "";
 	system("mkdir -p /etc/crontabs");
@@ -1239,6 +1347,7 @@ function cmd_schedule(force_off) {
 	print(sprintf("%J", {
 		enabled: enabled,
 		interval: uci_get("shoulderkop", "settings", "update_interval"),
+		auto_update: (uci_get("shoulderkop", "settings", "auto_update") == "1"),
 		crontab: body,
 		rclink: enabled
 	}));
@@ -1321,7 +1430,11 @@ if (cmd == "convert") {
 	exit(cmd_schedule(ARGV[1] == "off"));
 } else if (cmd == "diag") {
 	exit(cmd_diag(ARGV));
+} else if (cmd == "lists") {
+	exit(cmd_lists(ARGV));
+} else if (cmd == "self-update") {
+	exit(cmd_selfupdate(ARGV));
 } else {
-	print("usage: shoulderkop <convert|update|apply|list_servers|links|status|schedule|diag> [--rebuild] [--url=..] [--mode=lte|wifi] [--interval=1h] [--urltest=30s] [--schedule=0|1] [--yt-lists=youtube] [--eu-lists=russia_inside,telegram] [--section=yt|eu|lte] [--file=..] [--json] [--grouped] [--podkop] [off]");
+	print("usage: shoulderkop <convert|update|apply|list_servers|links|status|schedule|diag|lists|self-update> [--rebuild] [--url=..] [--mode=lte|wifi] [--interval=1h] [--urltest=30s] [--schedule=0|1] [--yt-lists=youtube] [--eu-lists=russia_inside,telegram] [--section=yt|eu|lte] [--file=..] [--json] [--grouped] [--podkop] [--force] [off]");
 	exit(2);
 }
