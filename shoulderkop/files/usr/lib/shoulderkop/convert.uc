@@ -45,7 +45,11 @@ function strip_tag_prefix(tag) {
 // имя сервера: remarks для «generic»-узла, иначе tag без "NN | "
 function server_name(config, outbound) {
 	let tag = trim(as_string(outbound.tag));
-	if (tag == "" || tag == "proxy" || tag == "proxy-out") {
+	// `proxy-1` — такой же служебный тег панели, как `proxy`: имя хоста
+	// лежит в remarks. Для балансера номера всё равно пересчитает
+	// subscription.uc («Хост (1)», «Хост (2)»).
+	if (tag == "" || tag == "proxy" || tag == "proxy-out" ||
+	    match(tag, /^proxy-[0-9]+$/) != null) {
 		let n = trim(as_string(config.remarks || config.remark || config.name || config.ps));
 		return n != "" ? n : tag;
 	}
