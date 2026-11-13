@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=shoulderkop
-PKG_VERSION:=0.5.4
+PKG_VERSION:=0.5.5
 PKG_RELEASE:=1
 
 PKG_LICENSE:=MIT

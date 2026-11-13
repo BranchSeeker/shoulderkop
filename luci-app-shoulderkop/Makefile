@@ -9,7 +9,7 @@ LUCI_PKGARCH:=all
 
 PKG_MAINTAINER:=shoulderkop
 PKG_LICENSE:=MIT
-PKG_VERSION:=0.5.4
+PKG_VERSION:=0.5.5
 PKG_RELEASE:=1
 
 include $(TOPDIR)/feeds/luci/luci.mk

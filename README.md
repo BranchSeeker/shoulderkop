@@ -51,6 +51,30 @@ wget -O /tmp/shoulderkop-install.sh https://github.com/BranchSeeker/shoulderkop/
 sh /tmp/shoulderkop-install.sh
 ```
 
+`| sh` — вариант «без вопросов»: stdin занят скриптом, поэтому extended ставится,
+а подписку потом добавляют в LuCI. Если нужны вопросы — только второй вариант.
+
+### Если github.com не открывается
+
+В РФ `github.com` иногда недоступен целиком (TCP timeout), хотя интернет работает.
+Проверить, в чём дело:
+
+```sh
+wget -O /dev/null https://ya.ru; echo "интернет rc=$?"
+wget -O /dev/null https://github.com; echo "github rc=$?"
+```
+
+Если падает только второй — возьмите установщик с CDN и включите зеркало:
+
+```sh
+wget -O /tmp/shoulderkop-install.sh https://cdn.jsdelivr.net/gh/BranchSeeker/shoulderkop@main/installer/shoulderkop-install.sh
+sh /tmp/shoulderkop-install.sh --mirror=https://gh-proxy.com/
+```
+
+Установщик пробует зеркала `gh-proxy.com`, `ghfast.top`, `ghproxy.net` по очереди —
+и для страниц релиза, и для пакетов. То же зеркало можно передать `shoulderkop upgrade`.
+Если не открываются оба адреса — проблема в интернете или в туннеле podkop, а не в ссылке.
+
 Флаги и разбор ошибок — [installer/README.md](installer/README.md). Готовые пакеты —
 в [релизах](https://github.com/BranchSeeker/shoulderkop/releases), сборка — в
 [PACKAGING.md](PACKAGING.md).
@@ -114,6 +138,7 @@ shoulderkop lists --force
 shoulderkop upgrade            # проверить и поставить новую версию, если есть
 shoulderkop upgrade --check    # только проверить, ничего не ставить
 shoulderkop upgrade --force    # переустановить текущую версию
+shoulderkop upgrade --mirror=https://gh-proxy.com/   # если github.com заблокирован
 ```
 
 `self-update` — прежнее имя той же команды (его использует cron), обе формы

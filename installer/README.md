@@ -16,7 +16,9 @@ podkop, sing-box-extended, shoulderkop — и сам применяет подп
 * менеджер пакетов `apk` (OpenWrt 25.12+) или `opkg` (24.10);
 * права root;
 * ~15 МБ свободного места в `/overlay`, если podkop ещё не установлен (при обновлении место под podkop не проверяется);
-* доступ к `github.com` (при проблемах — `--mirror=`);
+* доступ к `github.com`; если его нет — зеркало `--mirror=` (по умолчанию пробуются
+  `gh-proxy.com`, `ghfast.top`, `ghproxy.net`), а сам скрипт можно взять через
+  `https://cdn.jsdelivr.net/gh/BranchSeeker/shoulderkop@main/installer/shoulderkop-install.sh`;
 * **`curl`** — обязателен: если его нет, установщик ставит его первым делом
   (`apk add curl` / `opkg install curl`), потому что busybox-`wget` на чистом OpenWrt не
   понимает нужных флагов (`-T`, `-t`, `-U`) и молча ломает все загрузки.

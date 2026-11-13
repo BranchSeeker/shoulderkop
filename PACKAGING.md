@@ -65,6 +65,14 @@ wget -O /tmp/sk-install.sh https://github.com/BranchSeeker/shoulderkop/releases/
 wget -O /tmp/sk-install.sh https://raw.githubusercontent.com/BranchSeeker/shoulderkop/main/installer/shoulderkop-install.sh
 ```
 
+Если `github.com` недоступен (блокировка провайдера), те же файлы отдаёт CDN jsDelivr,
+а пакеты установщик скачает через зеркало:
+
+```sh
+wget -O /tmp/sk-install.sh https://cdn.jsdelivr.net/gh/BranchSeeker/shoulderkop@main/installer/shoulderkop-install.sh
+sh /tmp/sk-install.sh --mirror=https://gh-proxy.com/
+```
+
 Из `bin/packages` копируются только файлы своих пакетов: рядом лежат зависимости из фидов,
 собранные как побочный эффект, и в релиз они попадать не должны.
 

@@ -23,7 +23,7 @@ SBE_REPO="shtorm-7/sing-box-extended"
 SBE_PIN="v1.14.3-extended-2.7.3"
 SBE_MIN="1.14.1-extended-2.7.2"
 SK_REPO="${SK_REPO:-BranchSeeker/shoulderkop}"
-MIRRORS="https://ghproxy.net/ https://gh-proxy.com/ https://ghfast.top/"
+MIRRORS="https://gh-proxy.com/ https://ghfast.top/ https://ghproxy.net/"
 
 WORK=""
 LOG="/tmp/shoulderkop-install.log"
@@ -46,6 +46,7 @@ SB_FORMAT=""
 PKG_FORCE=""
 LOCAL_DIR=""
 BASE_URL=""
+MIRROR_USED=""
 
 DISTRIB_ID=""
 DISTRIB_RELEASE=""
@@ -223,19 +224,45 @@ ask_url() {
 
 # ---------- сеть ----------
 
-fetch() {
-	_fetch_url="$1"
+# один URL без зеркал (stdout); $2 — таймаут
+fetch_raw() {
+	_fr_url="$1"
+	_fr_t="${2:-30}"
 	# Порядок важен: на чистом OpenWrt wget — это busybox, он не понимает
 	# -T/-t/-U/--no-check-certificate и молча падает. uclient-fetch есть всегда.
 	if have curl; then
-		curl -fsSL --connect-timeout 10 --max-time 30 -A "$UA" "$_fetch_url" 2>/dev/null
+		curl -fsSL --connect-timeout 8 --max-time "$_fr_t" -A "$UA" "$_fr_url" 2>/dev/null
 	elif have uclient-fetch; then
-		uclient-fetch -q -T 20 -U "$UA" -O - "$_fetch_url" 2>/dev/null
+		uclient-fetch -q -T "$_fr_t" -U "$UA" -O - "$_fr_url" 2>/dev/null
 	elif have wget; then
-		wget -q -O - "$_fetch_url" 2>/dev/null
+		wget -q -O - "$_fr_url" 2>/dev/null
 	else
 		return 1
 	fi
+}
+
+# github.com в РФ бывает недоступен целиком (TCP timeout), а зеркало-прокси
+# работает: https://gh-proxy.com/https://github.com/... . API зеркала не
+# проксируют, поэтому api.github.com пробуем только напрямую.
+fetch() {
+	_fetch_url="$1"
+	_fetch_out=$(fetch_raw "$_fetch_url" 30)
+	if [ -n "$_fetch_out" ]; then
+		printf '%s\n' "$_fetch_out"
+		return 0
+	fi
+	case "$_fetch_url" in
+		*api.github.com*) return 1 ;;
+	esac
+	for _fetch_m in $MIRRORS; do
+		_fetch_out=$(fetch_raw "${_fetch_m}${_fetch_url}" 15)
+		if [ -n "$_fetch_out" ]; then
+			MIRROR_USED="$_fetch_m"
+			printf '%s\n' "$_fetch_out"
+			return 0
+		fi
+	done
+	return 1
 }
 
 dl() {
@@ -537,10 +564,11 @@ preflight() {
 		_zen=$(fetch "https://api.github.com/zen" | head -n 1)
 		if [ -n "$_zen" ]; then
 			ok "сеть и DNS в порядке"
-		elif fetch "https://github.com" >/dev/null 2>&1; then
+		elif fetch "https://github.com/$SK_REPO/releases/latest" >/dev/null 2>&1; then
 			warn "api.github.com недоступен, но github.com отвечает"
+			[ -n "$MIRROR_USED" ] && info "github.com открыт через зеркало $MIRROR_USED"
 		else
-			die "нет доступа к github.com — проверьте интернет и DNS"
+			die "нет доступа к github.com — проверьте интернет и DNS (или укажите зеркало: --mirror=https://gh-proxy.com/)"
 		fi
 	fi
 

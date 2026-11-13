@@ -23,6 +23,52 @@ const STATE = "/tmp/shoulderkop.selfupdate.json";
 const LOCK = "/tmp/shoulderkop.selfupdate.lock";
 const LOG = "/tmp/shoulderkop.selfupdate.log";
 
+// В РФ github.com бывает недоступен целиком (TCP timeout), при этом
+// зеркало-прокси вида https://gh-proxy.com/https://github.com/... работает.
+// api.github.com зеркала не проксируют (403), поэтому его не трогаем.
+let MIRRORS = [ "https://gh-proxy.com/", "https://ghfast.top/", "https://ghproxy.net/" ];
+
+let mirror_used = false;
+
+function mirrorable(url) {
+	return (index("" + url, "://github.com/") >= 0) ||
+		(index("" + url, "://raw.githubusercontent.com/") >= 0);
+}
+
+// запрос с запасным путём через зеркало: только когда прямой путь не дал
+// ответа или упал с 5xx (404/403 зеркало всё равно не исправит)
+function fetch_any(url, opts) {
+	let r = fetchmod.fetch(url, opts);
+	if (r.http == 200 || r.http == 403 || r.http == 404 || !mirrorable(url))
+		return r;
+	if (r.http != 0 && r.http < 500)
+		return r;
+	for (let m in MIRRORS) {
+		let r2 = fetchmod.fetch(m + url, opts);
+		if (r2.http == 200) {
+			mirror_used = true;
+			return r2;
+		}
+	}
+	return r;
+}
+
+function fetch_file_any(url, dest, opts) {
+	let r = fetchmod.fetch_to_file(url, dest, opts);
+	if (r.ok || !mirrorable(url))
+		return r;
+	if (r.http != 0 && r.http < 500)
+		return r;
+	for (let m in MIRRORS) {
+		let r2 = fetchmod.fetch_to_file(m + url, dest, opts);
+		if (r2.ok) {
+			mirror_used = true;
+			return r2;
+		}
+	}
+	return r;
+}
+
 let seq = 0;
 
 function own_pid() {
@@ -59,6 +105,9 @@ function read_state() {
 }
 
 function write_state(s) {
+	// отметка, что GitHub пришлось тянуть через зеркало — видна в status
+	if (mirror_used)
+		s.mirror = "yes";
 	fs.writefile(STATE, sprintf("%J", s));
 }
 
@@ -171,7 +220,7 @@ function release_assets_from_api(doc) {
 
 function release_assets_from_html(tag) {
 	let url = "https://github.com/" + REPO + "/releases/expanded_assets/" + tag;
-	let r = fetchmod.fetch(url, { ua: UA, proxy: true });
+	let r = fetch_any(url, { ua: UA, proxy: true });
 	if (r.http != 200 && r.http != 0)
 		return [];
 	let out = [];
@@ -213,7 +262,7 @@ function latest_release() {
 	}
 
 	// API мог отдать 403 (лимит) — разбираем страницу релиза
-	let hr = fetchmod.fetch(HTML_LATEST, { ua: UA, proxy: true });
+	let hr = fetch_any(HTML_LATEST, { ua: UA, proxy: true });
 	let tag = "";
 	let marker = "/releases/tag/";
 	let off = 0;
@@ -291,7 +340,7 @@ function verify_sums(dir, files, sums_asset) {
 		return { ok: true, errors: [ "SHA256SUMS нет в релизе — проверка пропущена" ] };
 
 	let path = dir + "/SHA256SUMS";
-	let r = fetchmod.fetch_to_file(sums_asset.url, path, { ua: UA, fast: true, proxy: true });
+	let r = fetch_file_any(sums_asset.url, path, { ua: UA, fast: true, proxy: true });
 	if (!r.ok) {
 		push(errors, "SHA256SUMS не скачался (HTTP " + r.http + ")");
 		return { ok: false, errors: errors };
@@ -364,6 +413,15 @@ function run(opts) {
 	let check_only = (opts.check == true);
 	let force = (opts.force == true);
 
+	// своё зеркало важнее списка по умолчанию: сети бывают разные
+	let custom = trim("" + (opts.mirror || ""));
+	if (custom != "") {
+		if (substr(custom, length(custom) - 1) != "/")
+			custom += "/";
+		MIRRORS = [ custom ];
+	}
+	mirror_used = false;
+
 	let current = installed_version();
 	let latest = latest_release();
 	let now = time();
@@ -431,7 +489,7 @@ function run(opts) {
 	let downloaded = [];
 	for (let f in files) {
 		let dest = dir + "/" + f.name;
-		let r = fetchmod.fetch_to_file(f.url, dest, { ua: UA, proxy: true });
+		let r = fetch_file_any(f.url, dest, { ua: UA, proxy: true });
 		if (!r.ok) {
 			push(result.errors, "не скачался " + f.name + " (HTTP " + r.http + ")");
 			lock_release();

@@ -1207,9 +1207,10 @@ function cmd_status() {
 // Обновление пакета вручную: `shoulderkop upgrade` (короткая команда для SSH)
 // и прежнее `self-update` — одна и та же функция. `update` занято обновлением
 // подписки, поэтому апгрейд пакета называется upgrade.
-// --check только проверяет, --force переустанавливает.
+// --check только проверяет, --force переустанавливает,
+// --mirror=URL — тянуть GitHub через своё зеркало (когда github.com недоступен).
 function cmd_selfupdate(argv) {
-	let o = { check: false, force: false, quiet: false, json: false };
+	let o = { check: false, force: false, quiet: false, json: false, mirror: "" };
 	for (let i = 1; i < length(argv); i++) {
 		if (argv[i] == "--check")
 			o.check = true;
@@ -1219,6 +1220,8 @@ function cmd_selfupdate(argv) {
 			o.quiet = true;
 		else if (argv[i] == "--json")
 			o.json = true;
+		else if (substr(argv[i], 0, 9) == "--mirror=")
+			o.mirror = substr(argv[i], 9);
 	}
 
 	// По SSH 10–20 секунд тишины выглядят как зависание.
@@ -1250,7 +1253,8 @@ function cmd_selfupdate(argv) {
 	else if (r.status == "busy")
 		print("обновление: уже идёт другой запуск — подождите и повторите\n");
 	else if (r.status == "updated")
-		print("обновление: " + r.previous + " → " + r.current + "\n");
+		print("обновление: " + r.previous + " → " + r.current +
+			((r.mirror == "yes") ? " (через зеркало GitHub)\n" : "\n"));
 	else
 		print(sprintf("%J", r) + "\n");
 	return (r.status == "error") ? 1 : 0;
@@ -1446,6 +1450,6 @@ if (cmd == "convert") {
 } else if (cmd == "upgrade" || cmd == "selfupdate" || cmd == "self-update") {
 	exit(cmd_selfupdate(ARGV));
 } else {
-	print("usage: shoulderkop <convert|update|apply|list_servers|links|status|schedule|diag|lists|upgrade|self-update> [--rebuild] [--url=..] [--mode=lte|wifi] [--interval=1h] [--urltest=30s] [--schedule=0|1] [--yt-lists=youtube] [--eu-lists=russia_inside,telegram] [--section=yt|eu|lte] [--file=..] [--json] [--grouped] [--podkop] [--force] [off]");
+	print("usage: shoulderkop <convert|update|apply|list_servers|links|status|schedule|diag|lists|upgrade|self-update> [--rebuild] [--url=..] [--mode=lte|wifi] [--interval=1h] [--urltest=30s] [--schedule=0|1] [--yt-lists=youtube] [--eu-lists=russia_inside,telegram] [--section=yt|eu|lte] [--file=..] [--json] [--grouped] [--podkop] [--force] [--mirror=https://gh-proxy.com/] [off]");
 	exit(2);
 }
