@@ -758,7 +758,9 @@ function cmd_update(a) {
 			suspended_at: sus.at,
 			actions: sus.actions,
 			restart_attempts: 0,
-			paused_clean: sus.paused_clean == true
+			paused_clean: sus.paused_clean == true,
+			dns_ok: sus.dns_ok == true,
+			internet_ok: sus.internet_ok == true
 		};
 		for (let e in sus.errors)
 			push(result.errors, e);
@@ -885,6 +887,8 @@ function cmd_apply(a) {
 			result.suspended_at = sus.at;
 			result.actions = sus.actions;
 			result.paused_clean = sus.paused_clean == true;
+			result.dns_ok = sus.dns_ok == true;
+			result.internet_ok = sus.internet_ok == true;
 			for (let e in sus.errors)
 				push(result.errors, e);
 			push(result.warnings, "подписка неактивна: узлов нет, туннель остаётся на паузе");

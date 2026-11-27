@@ -19,6 +19,7 @@ let fs = require("fs");
 let uci = require("uci");
 
 const PODKOP_INIT = "/etc/init.d/podkop";
+const PODKOP_BIN = "/usr/bin/podkop";
 const SINGBOX_INIT = "/etc/init.d/sing-box";
 const NFT_TABLE = "PodkopTable";
 const RT_TABLE = "podkop";        // RT_TABLE_NAME в podkop
@@ -26,6 +27,9 @@ const DNS_ADDR = "127.0.0.42";    // SB_DNS_INBOUND_ADDRESS в podkop
 const LOCK = "/tmp/shoulderkop.apply.lock";
 const LOCK_STALE_FRESH = 15;      // столько секунд лок без pid считается живым
 const RESTART_MARK = "/tmp/shoulderkop.restart";
+
+// что podkop оставляет в @dnsmasq[0] на время работы (кроме server=127.0.0.42)
+const PODKOP_DNS_BACKUPS = [ "podkop_noresolv", "podkop_cachesize", "podkop_server" ];
 
 // Свой pid: в ucode нет getpid(), берём первое поле /proc/self/stat.
 function own_pid() {
@@ -120,16 +124,93 @@ function dns_config_points_to_podkop() {
 	return found;
 }
 
+// Живой резолв через dnsmasq на 127.0.0.1 (dig, если он есть, иначе nslookup).
+function dns_resolves() {
+	if (have_dig())
+		return trim(sh("dig @127.0.0.1 www.gstatic.com +timeout=3 +tries=1 +short 2>/dev/null")) != "";
+	let out = sh("nslookup www.gstatic.com 127.0.0.1 2>/dev/null");
+	return index(out, "Name:") >= 0 && index(out, "can't find") < 0;
+}
+
 // Резолв через dnsmasq на 127.0.0.1. Подсказки из конфига мало (клиенты могут
 // остаться на DNS провайдера), одного резолва тоже мало (до настройки dnsmasq
 // отвечает и без podkop) — поэтому нужны оба признака.
 function dns_points_to_podkop() {
 	if (!dns_config_points_to_podkop())
 		return false;
-	if (have_dig())
-		return trim(sh("dig @127.0.0.1 www.gstatic.com +timeout=3 +tries=1 +short 2>/dev/null")) != "";
-	let out = sh("nslookup www.gstatic.com 127.0.0.1 2>/dev/null");
-	return index(out, "Name:") >= 0 && index(out, "can't find") < 0;
+	return dns_resolves();
+}
+
+// Живой DNS без требования 127.0.0.42: после паузы dnsmasq должен отвечать
+// через провайдера, и это единственный признак, который видит клиент LAN.
+function dns_ok() {
+	return dns_resolves();
+}
+
+// Слепок @dnsmasq[0]: server со 127.0.0.42, резервные копии podkop_* и
+// noresolv. Нужен и до, и после dnsmasq_restore: по резервной копии видно,
+// был ли noresolv=1 настройкой пользователя (тогда его и надо вернуть).
+function dns_state() {
+	let st = { server: false, backups: false, noresolv: "", backup_noresolv: "" };
+	let c = uci.cursor();
+	if (!c.load("dhcp"))
+		return st;
+	c.foreach("dhcp", "dnsmasq", function (s) {
+		for (let v in as_list(s.server))
+			if (trim("" + v) == DNS_ADDR)
+				st.server = true;
+		for (let opt in PODKOP_DNS_BACKUPS)
+			if (s[opt] != null && trim("" + s[opt]) != "")
+				st.backups = true;
+		st.noresolv = trim("" + (s.noresolv || ""));
+		st.backup_noresolv = trim("" + (s.podkop_noresolv || ""));
+	});
+	return st;
+}
+
+// Осталось ли что-то от podkop: server 127.0.0.42, резервные копии или
+// noresolv=1, которого не было у пользователя до podkop.
+function dns_dirty(before, now) {
+	if (now.server || now.backups)
+		return true;
+	if (now.noresolv == "1" && before.backup_noresolv != "1")
+		return true;
+	return false;
+}
+
+// Вернуть dnsmasq провайдеру: `/usr/bin/podkop stop` вызывает dnsmasq_restore —
+// убирает server со 127.0.0.42, возвращает noresolv/cachesize и перезапускает
+// dnsmasq. Потом проверяем, что следов podkop не осталось и резолв живой.
+function restore_dns() {
+	let actions = [];
+	let errors = [];
+
+	let before = dns_state();
+	// трогаем dnsmasq, только если в нём действительно есть podkop
+	let touched = (before.server || before.backups);
+	let after = before;
+
+	if (touched) {
+		if (fs.stat(PODKOP_BIN) != null) {
+			quiet(PODKOP_BIN + " stop");
+			after = dns_state();
+			if (!dns_dirty(before, after))
+				push(actions, "dnsmasq: возвращён провайдеру");
+		}
+		else {
+			push(errors, "/usr/bin/podkop не найден: dnsmasq не вернуть провайдеру");
+		}
+	}
+
+	let ok = !touched || !dns_dirty(before, after);
+	if (!ok)
+		push(errors, "dnsmasq всё ещё указывает на podkop (127.0.0.42, podkop_* или noresolv=1)");
+
+	let resolved = dns_resolves();
+	if (!resolved)
+		push(errors, "dnsmasq на 127.0.0.1 не резолвит имена");
+
+	return { ok: ok, dns_ok: resolved, actions: actions, errors: errors };
 }
 
 function state() {
@@ -417,6 +498,8 @@ return {
 	tunnel_up: tunnel_up,
 	singbox_running: singbox_running,
 	dns_points_to_podkop: dns_points_to_podkop,
+	dns_ok: dns_ok,
+	restore_dns: restore_dns,
 	state: state,
 	restart_and_wait: restart_and_wait,
 	cleanup: cleanup,

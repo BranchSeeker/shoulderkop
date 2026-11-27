@@ -20,6 +20,7 @@
 let fs = require("fs");
 let uci = require("uci");
 let podkopctl = require("podkopctl");
+let diagmod = require("diag");
 
 const PODKOP = "/etc/init.d/podkop";
 const PODKOP_BIN = "/usr/bin/podkop";
@@ -193,7 +194,19 @@ function suspend() {
 	for (let e in cl.errors)
 		push(errors, e);
 
-	let paused_clean = (cl.ok && !podkopctl.singbox_running() && !podkopctl.tunnel_up());
+	// dnsmasq возвращаем провайдеру отдельно: podkop мог быть уже мёртв, а
+	// server=127.0.0.42 остаться — тогда у LAN нет DNS, даже если nft снят.
+	let rd = podkopctl.restore_dns();
+	for (let a in rd.actions)
+		push(actions, a);
+	for (let e in rd.errors)
+		push(errors, e);
+
+	// проверка с точки зрения клиента LAN: резолв через dnsmasq и интернет
+	let internet_ok = diagmod.internet_ok();
+
+	let paused_clean = (cl.ok && rd.ok && rd.dns_ok &&
+		!podkopctl.singbox_running() && !podkopctl.tunnel_up());
 	if (!paused_clean && length(errors) == 0)
 		push(errors, "после паузы остались следы туннеля");
 
@@ -206,7 +219,9 @@ function suspend() {
 		at: info.at,
 		init: init_list,
 		running: run_list,
-		paused_clean: paused_clean
+		paused_clean: paused_clean,
+		dns_ok: rd.dns_ok,
+		internet_ok: internet_ok
 	};
 }
 

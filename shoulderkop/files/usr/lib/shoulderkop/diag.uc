@@ -416,12 +416,17 @@ function run_checks(quick, paused) {
 	let box = podkopctl.singbox_running();
 	let table = podkopctl.tunnel_up();
 
-	// Пауза подписки: lifecycle штатно погасил podkop, sing-box и nft сняты.
-	// Автозапуск podkop при паузе не проверяем и не включаем — иначе вернём
-	// туннель с истёкшей подпиской и оставим LAN без интернета.
+	// Пауза подписки: lifecycle штатно погасил podkop, sing-box и nft сняты,
+	// а dnsmasq возвращён провайдеру. Автозапуск podkop при паузе не проверяем
+	// и не включаем — иначе вернём туннель с истёкшей подпиской и оставим LAN
+	// без интернета. Резолв проверяем глазами LAN-клиента: если dnsmasq всё
+	// ещё указывает на мёртвый podkop, интернета у клиентов нет.
 	if (paused) {
 		add("sing-box", !box, box ? "процесс работает, а при паузе его быть не должно" : "процесс не найден");
 		add("nft", !table, table ? "таблица PodkopTable есть, а при паузе её быть не должно" : "таблицы PodkopTable нет");
+
+		let resolved = podkopctl.dns_ok();
+		add("dns", resolved, resolved ? "резолв через 127.0.0.1 работает" : "резолв через 127.0.0.1 не работает");
 		return checks;
 	}
 
@@ -443,17 +448,38 @@ function run_checks(quick, paused) {
 }
 
 // Починка при паузе: только снятие. Никакого enable/start — podkop должен
-// остаться выключенным, пока подписка не станет активной снова.
+// остаться выключенным, пока подписка не станет активной снова. Кроме nft и
+// sing-box возвращаем dnsmasq провайдеру: иначе LAN останется без DNS.
 function repair_paused(actions, errors) {
-	if (!podkopctl.singbox_running() && !podkopctl.tunnel_up())
-		return false;
+	if (podkopctl.singbox_running() || podkopctl.tunnel_up()) {
+		let r = podkopctl.cleanup({ force: true });
+		for (let a in r.actions)
+			push(actions, a);
+		for (let e in r.errors)
+			push(errors, e);
+	}
 
-	let r = podkopctl.cleanup({ force: true });
-	for (let a in r.actions)
+	let rd = podkopctl.restore_dns();
+	for (let a in rd.actions)
 		push(actions, a);
-	for (let e in r.errors)
+	for (let e in rd.errors)
 		push(errors, e);
+
 	return true;
+}
+
+function check_ok(checks, name) {
+	for (let c in checks)
+		if (c.name == name)
+			return c.ok == true;
+	return false;
+}
+
+// В отчёт паузы кладём то, что видит клиент LAN: живой DNS и интернет.
+function pause_fields(report, checks) {
+	report.dns_ok = check_ok(checks, "dns");
+	report.internet_ok = check_ok(checks, "internet");
+	return report;
 }
 
 function failed(checks) {
@@ -546,6 +572,8 @@ function run(opts) {
 			actions: [],
 			errors: []
 		};
+		if (paused && !quick)
+			pause_fields(ok_report, checks);
 		save(ok_report);
 		return ok_report;
 	}
@@ -639,8 +667,10 @@ function run(opts) {
 		errors: errors
 	};
 
-	save(report);
+	if (paused && !quick)
+		pause_fields(report, checks);
 
+	save(report);
 	if (length(actions) > 0)
 		log_msg("починка: " + join("; ", actions));
 	if (length(bad) > 0)
