@@ -11,7 +11,10 @@ sing-box и раскладывает их по секциям podkop. Своег
 | `node --check luci-app-shoulderkop/htdocs/luci-static/resources/view/shoulderkop/shoulderkop.js` | проверить синтаксис LuCI-страницы |
 | `sh -n installer/shoulderkop-install.sh` (через Git Bash) | проверить синтаксис установщика |
 | `ucode -c <файл>.uc` | проверить синтаксис ucode (есть только на OpenWrt и в CI) |
+| `sh tools/verify_v060.sh` (на роутере) | четыре сценария: свежая установка без reboot, снятие `roblox`, `--rebuild`, пауза без nft |
 | `git push origin main && git tag vX.Y.Z && git push origin vX.Y.Z` | выпустить релиз: CI соберёт apk/ipk и опубликует |
+
+`tools/` — локальная папка, в git не входит: скрипт проверки лежит только на этой машине.
 
 Локальной сборки пакета нет — пакеты собирает GitHub Actions (`.github/workflows/build.yml`).
 
