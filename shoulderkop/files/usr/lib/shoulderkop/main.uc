@@ -517,9 +517,22 @@ function finish(result, code) {
 	return code;
 }
 
-// отчёт, когда применить настройки не дали: другой запуск уже держит лок
+// Правда о туннеле в отчёте. tunnel_up/dns_* берём только из результатов
+// restart_and_wait(), cleanup() или ожидания внутри resume(); пока действий не
+// было — null, чтобы состояние «до» не выдавалось за результат (решение 11).
+function tunnel_report(result, src, internet_ok) {
+	let s = src || {};
+	result.tunnel_up = (s.tunnel_up == null) ? null : (s.tunnel_up == true);
+	result.dns_points_to_podkop = (s.dns_ok == null) ? null : (s.dns_ok == true);
+	result.dns_ok = result.dns_points_to_podkop;
+	result.internet_ok = (internet_ok == null) ? null : (internet_ok == true);
+	return result;
+}
+
+// отчёт, когда применить настройки не дали: другой запуск уже держит лок.
+// Ничего не измеряли и не трогали — поля туннеля остаются null.
 function busy_report() {
-	return {
+	let r = {
 		updated: time(),
 		status: "busy",
 		count: 0,
@@ -536,8 +549,10 @@ function busy_report() {
 		checked: [],
 		suspended: lifecycle.is_suspended(),
 		suspended_at: lifecycle.suspended_info().at,
-		restart_attempts: 0
+		restart_attempts: 0,
+		paused_clean: null
 	};
+	return tunnel_report(r, null, null);
 }
 
 // применить узлы и вернуть отчёт; podkop здесь не перезапускается — это делает
@@ -551,7 +566,7 @@ function apply_nodes(nodes, errors, warnings, opts) {
 			push(errors, applied.error);
 	}
 
-	return {
+	let r = {
 		count: length(nodes),
 		mode: "wifi",
 		lan: (applied != null) ? applied.lan : null,
@@ -563,8 +578,11 @@ function apply_nodes(nodes, errors, warnings, opts) {
 		removed: (applied != null) ? applied.removed : [],
 		rebuilt: (applied != null) ? (applied.rebuilt == true) : false,
 		errors: errors,
-		warnings: warnings
+		warnings: warnings,
+		restart_attempts: 0,
+		paused_clean: false
 	};
+	return tunnel_report(r, null, null);
 }
 
 // Перезапуск podkop после раскладки: restart (не reload) и ожидание готовности.
@@ -578,7 +596,7 @@ function tunnel_restart(result) {
 	let rs = podkopctl.restart_and_wait();
 	result.reloaded = (rs.attempts > 0);
 	result.restart_attempts = rs.attempts;
-	result.tunnel_up = rs.tunnel_up;
+	tunnel_report(result, rs, null);
 	for (let e in rs.errors)
 		push(result.errors, e);
 	return result;
@@ -758,10 +776,10 @@ function cmd_update(a) {
 			suspended_at: sus.at,
 			actions: sus.actions,
 			restart_attempts: 0,
-			paused_clean: sus.paused_clean == true,
-			dns_ok: sus.dns_ok == true,
-			internet_ok: sus.internet_ok == true
+			paused_clean: sus.paused_clean == true
 		};
+		// tunnel_up и резолв — из проверенного результата cleanup() в suspend()
+		tunnel_report(result, sus, sus.internet_ok == true);
 		for (let e in sus.errors)
 			push(result.errors, e);
 		if (uci_get("shoulderkop", "settings", "enable_schedule") != "1")
@@ -789,9 +807,10 @@ function cmd_update(a) {
 			checked: fetched.checked,
 			suspended: suspended,
 			suspended_at: info.at,
-			restart_attempts: 0
+			restart_attempts: 0,
+			paused_clean: null
 		};
-		return finish(result, 1);
+		return finish(tunnel_report(result, null, null), 1);
 	}
 
 	// раскладка: rebuild = «Пересобрать секции» или подписок стало меньше
@@ -824,11 +843,13 @@ function cmd_update(a) {
 			push(result.errors, e);
 		result.suspended = r.suspended;
 		result.service = lifecycle.service_state();
-		result.tunnel_up = podkopctl.tunnel_up();
+		// tunnel_up/dns_ok — из ожидания внутри resume(), а не из повторного опроса
+		tunnel_report(result, r, null);
 	} else {
 		// сразу после раскладки: restart (не reload) и ожидание готовности
 		tunnel_restart(result);
 	}
+	result.internet_ok = diagmod.internet_ok();
 
 	// узлы снова появились — если сидели в direct, возвращаемся в туннель
 	if (uci_get("shoulderkop", "settings", "direct_mode") == "1") {
@@ -879,7 +900,8 @@ function cmd_apply(a) {
 			checked: (cache == null) ? [] : (cache.checked || []),
 			suspended: suspended,
 			suspended_at: lifecycle.suspended_info().at,
-			restart_attempts: 0
+			restart_attempts: 0,
+			paused_clean: null
 		};
 		if (expired) {
 			let sus = lifecycle.suspend();
@@ -887,11 +909,14 @@ function cmd_apply(a) {
 			result.suspended_at = sus.at;
 			result.actions = sus.actions;
 			result.paused_clean = sus.paused_clean == true;
-			result.dns_ok = sus.dns_ok == true;
-			result.internet_ok = sus.internet_ok == true;
+			// tunnel_up и резолв — из проверенного результата cleanup()
+			tunnel_report(result, sus, sus.internet_ok == true);
 			for (let e in sus.errors)
 				push(result.errors, e);
 			push(result.warnings, "подписка неактивна: узлов нет, туннель остаётся на паузе");
+		}
+		else {
+			tunnel_report(result, null, null);
 		}
 		return finish(result, expired ? 0 : 1);
 	}
@@ -914,10 +939,12 @@ function cmd_apply(a) {
 			push(result.errors, e);
 		result.suspended = r.suspended;
 		result.service = lifecycle.service_state();
-		result.tunnel_up = podkopctl.tunnel_up();
+		// tunnel_up/dns_ok — из ожидания внутри resume()
+		tunnel_report(result, r, null);
 	} else {
 		tunnel_restart(result);
 	}
+	result.internet_ok = diagmod.internet_ok();
 
 	return finish(result, 0);
 }
@@ -1229,6 +1256,18 @@ function cmd_status() {
 		st.status = info.suspended ? "expired" : "unknown";
 		st.count = 0;
 	}
+
+	// Набор полей отчёта одинаков в любом состоянии: LuCI и документация читают
+	// их, не проверяя наличие ключей, а отчёт в /tmp мог остаться от прежней
+	// версии пакета.
+	if (st.mode == null)
+		st.mode = "wifi";
+	st.tunnel_up = (st.tunnel_up == null) ? null : (st.tunnel_up == true);
+	st.dns_points_to_podkop = (st.dns_points_to_podkop == null) ? null : (st.dns_points_to_podkop == true);
+	st.dns_ok = (st.dns_ok == null) ? null : (st.dns_ok == true);
+	st.internet_ok = (st.internet_ok == null) ? null : (st.internet_ok == true);
+	st.paused_clean = (st.paused_clean == null) ? null : (st.paused_clean == true);
+	st.restart_attempts = int("" + (st.restart_attempts || 0));
 
 	let ds = diagmod.state();
 	st.diag = {

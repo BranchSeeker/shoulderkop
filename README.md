@@ -17,10 +17,12 @@ podkop. Своего туннеля не поднимает — только н�
 3. Раскладывает серверы по двум секциям podkop — `skop_yt` (YouTube) и `skop_eu`
    (остальные сервисы) — и заполняет служебные поля: `source_network_interfaces`,
    `community_lists`.
-4. Перезапускает podkop и **дожидается готовности**: проверяет, что появилась таблица
-   `inet PodkopTable`, sing-box запущен, а dnsmasq смотрит на `127.0.0.42`. Если за
-   отведённое время не получилось — повторяет один раз (`restart_attempts`). Поэтому
-   первый запуск на чистом роутере работает без перезагрузки.
+4. Перезапускает podkop и **дожидается готовности**: таблица `inet PodkopTable` и процесс
+   sing-box должны продержаться два замера подряд, DNS проверяется живым резолвом через
+   `127.0.0.1` (запись `127.0.0.42` в `/etc/config/dhcp` — только подсказка). Ожидание
+   одной попытки — до 25 с, попыток не больше двух, всего не больше 50 с
+   (`restart_attempts`). Поэтому первый запуск на чистом роутере работает без
+   перезагрузки.
 5. Если подписка истекла — останавливает podkop и sing-box, снимает их автозапуск и
    убирает таблицу nft: LAN сразу получает интернет напрямую, без остатков туннеля.
 
@@ -161,7 +163,10 @@ shoulderkop:
 в этом случае туннель остаётся как есть, а в статусе пишется `status: "error"`.
 
 Состояние видно в LuCI и в `shoulderkop status`: `status: "expired"`, `suspended: true`,
-`suspended_at`, `actions`, `userinfo.expire`, `paused_clean`.
+`suspended_at`, `actions`, `userinfo.expire`, `paused_clean`, `tunnel_up`, `dns_ok`,
+`internet_ok`. После продления подписки `update` ждёт подъёма туннеля столько же,
+сколько занимает перезапуск podkop при раскладке, и снимает `suspended: true`, как
+только туннель или sing-box появились.
 
 Если удалить shoulderkop, пока туннель на паузе, автозапуск podkop и sing-box останется
 выключенным (это состояние хранится в `/etc/config/shoulderkop`) — верните его вручную:
@@ -210,9 +215,24 @@ shoulderkop diag [--force]    # проверить сеть и, если мож�
 shoulderkop upgrade [--check] # обновить сам пакет с GitHub Releases
 ```
 
-`update` и `status` печатают JSON с `tunnel_up` (туннель поднят), `restart_attempts`
-(сколько раз перезапускали podkop) и `paused_clean` (после паузы nft снят); LuCI
-показывает их понятными строками.
+`update` и `status` печатают один JSON. Поля отчёта: `status` (`active` / `expired` /
+`error` / `busy` — лок занят другим запуском, ничего не делали), `count`, `mode`
+(всегда `wifi`), `service`, `reloaded`, `applied[]`, `removed[]`, `rebuilt`,
+`errors[]`, `warnings[]`, `userinfo`, `checked[]`, `suspended`, `suspended_at`,
+`resumed`, а также правда о туннеле:
+
+| Поле | Смысл |
+| --- | --- |
+| `tunnel_up` | туннель поднят — из результата `restart_and_wait()`/`cleanup()` |
+| `dns_points_to_podkop` | резолв через `127.0.0.1` работает — по живому запросу, не по конфигу (в отчёте паузы — уже через провайдера) |
+| `dns_ok` | тот же живой резолв (в отчёте паузы — что dnsmasq отвечает без podkop) |
+| `internet_ok` | HTTP 204 с `gstatic.com/generate_204` прошёл |
+| `paused_clean` | после паузы nft снят, sing-box остановлен, dnsmasq возвращён провайдеру |
+| `restart_attempts` | сколько перезапусков podkop сделал `restart_and_wait()` (0…2) |
+
+Значение `null` в `tunnel_up`/`dns_*`/`internet_ok`/`paused_clean` значит «ничего не
+измеряли»: при `status: "busy"` и сетевой ошибке туннель не трогают. LuCI показывает
+эти поля понятными строками.
 
 `links` — обратная операция к конвертеру. По умолчанию берёт узлы из кэша
 подписки: `--section=yt|eu` оставляет одну секцию, `--file=SUB` читает файл

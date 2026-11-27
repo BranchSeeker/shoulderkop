@@ -205,8 +205,10 @@ function suspend() {
 	// проверка с точки зрения клиента LAN: резолв через dnsmasq и интернет
 	let internet_ok = diagmod.internet_ok();
 
+	// paused_clean — по проверенному результату cleanup(), а не по повторному
+	// опросу: именно он снимал таблицу и гасил sing-box и знает, что осталось.
 	let paused_clean = (cl.ok && rd.ok && rd.dns_ok &&
-		!podkopctl.singbox_running() && !podkopctl.tunnel_up());
+		cl.tunnel_up == false && cl.singbox_running == false);
 	if (!paused_clean && length(errors) == 0)
 		push(errors, "после паузы остались следы туннеля");
 
@@ -220,16 +222,20 @@ function suspend() {
 		init: init_list,
 		running: run_list,
 		paused_clean: paused_clean,
+		tunnel_up: (cl.tunnel_up == null) ? null : (cl.tunnel_up == true),
+		singbox_running: (cl.singbox_running == null) ? null : (cl.singbox_running == true),
 		dns_ok: rd.dns_ok,
 		internet_ok: internet_ok
 	};
 }
 
-// Вернуть автозапуск и поднять то, что было остановлено.
+// Вернуть автозапуск и поднять то, что было остановлено. Ждёт подъёма столько
+// же, сколько restart_and_wait(), и снимает suspended=1, если туннель уже есть.
 function resume() {
 	let c = load_settings();
 	if (c == null || !is_suspended())
-		return { resumed: false, suspended: false, actions: [], errors: [] };
+		return { resumed: false, suspended: false, actions: [], errors: [],
+			tunnel_up: null, dns_ok: null };
 
 	let init_list = as_list(c.get(CONFIG, SECTION, "suspended_init"));
 	let run_list = as_list(c.get(CONFIG, SECTION, "suspended_running"));
@@ -262,22 +268,33 @@ function resume() {
 		push(started, "sing-box");
 	}
 
-	// podkop поднимает sing-box не мгновенно (скачивание списков, сборка
-	// конфига), поэтому ждём до ~15 секунд: иначе статус врал бы «не
-	// поднялись», хотя туннель появился чуть позже.
-	if (length(started) > 0) {
-		for (let i = 0; i < 15; i++) {
-			system("sleep 1");
-			if (podkopctl.singbox_running() || podkopctl.tunnel_up())
-				break;
-		}
-		if (!podkopctl.singbox_running() && !podkopctl.tunnel_up())
-			push(errors, "podkop/sing-box не поднялись после активации подписки");
+	// podkop поднимает sing-box не мгновенно (сборка конфига, списки, DNS):
+	// ждём тем же ожиданием и с тем же бюджетом, что restart_and_wait() —
+	// 15 секунд не хватало, и на медленном старте туннель оставался погашенным,
+	// а suspended=1 висел до следующего cron.
+	let w = { ok: false, waited: 0, tunnel_up: false, singbox_running: false, dns_ok: false };
+	if (length(started) > 0)
+		w = podkopctl.wait_ready();
+	else {
+		// возвращать было нечего: пауза стояла, а туннель мог подняли руками —
+		// suspended=1 при живом туннеле оставлять нельзя
+		let st = podkopctl.state();
+		w.tunnel_up = st.tunnel_up;
+		w.singbox_running = st.running;
+		w.dns_ok = st.dns_ok;
 	}
 
-	if (length(errors) > 0) {
+	// «поднялся» — это уже живой туннель или процесс: оставлять suspended=1 при
+	// поднятом туннеле нельзя, иначе следующий update снова «возобновляет» паузу
+	let up = (w.tunnel_up == true || w.singbox_running == true);
+	if (length(started) > 0 && !up)
+		push(errors, "podkop/sing-box не поднялись за " + int(w.waited / 1000) +
+			" с после активации подписки");
+
+	if (!up && length(errors) > 0) {
 		// оставляем suspended=1: следующий cron попробует ещё раз
-		return { resumed: false, suspended: true, actions: actions, errors: errors };
+		return { resumed: false, suspended: true, actions: actions, errors: errors,
+			tunnel_up: false, dns_ok: w.dns_ok };
 	}
 
 	c.set(CONFIG, SECTION, "suspended", "0");
@@ -290,7 +307,8 @@ function resume() {
 	// resumed=false, если возвращать было нечего (пауза была пустой) — тогда
 	// и хвастаться в интерфейсе нечем.
 	return { resumed: (length(started) > 0 || length(actions) > 0),
-		suspended: false, actions: actions, errors: errors };
+		suspended: false, actions: actions, errors: errors,
+		tunnel_up: (w.tunnel_up == true), dns_ok: (w.dns_ok == true) };
 }
 
 // Текущее состояние сервисов для отчёта/LuCI

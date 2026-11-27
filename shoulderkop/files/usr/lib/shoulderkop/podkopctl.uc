@@ -5,11 +5,15 @@
 // dnsmasq; stop() же гасит туннель через procd только если инстансом владеет
 // procd (после reload его нет). Отсюда:
 //   - restart_and_wait() перезапускает podkop и ждёт таблицу inet PodkopTable,
-//     процесс sing-box и живой DNS на 127.0.0.42, повторяя попытку;
+//     процесс sing-box и живой резолв через dnsmasq на 127.0.0.1, повторяя
+//     попытку в пределах общего бюджета ожидания (50 с);
 //   - cleanup() снимает остатки туннеля явно (sing-box, nft, ip rule и таблица
 //     маршрутов podkop) и проверяет результат, чтобы LAN сразу получил интернет;
 //   - lock_*() сериализуют «запись конфига podkop → restart → ожидание»: podkop
 //     сам перезапускается на config.change, а LuCI может позвать apply вторым.
+//     Тот же лок берут restart_and_wait(), cleanup() и restore_dns(), поэтому
+//     cron-диагностика не перезапустит и не погасит podkop посреди чужой
+//     раскладки.
 //
 // Все внешние команды — через sh()/quiet() (временный файл, абсолютные пути).
 
@@ -132,19 +136,19 @@ function dns_resolves() {
 	return index(out, "Name:") >= 0 && index(out, "can't find") < 0;
 }
 
-// Резолв через dnsmasq на 127.0.0.1. Подсказки из конфига мало (клиенты могут
-// остаться на DNS провайдера), одного резолва тоже мало (до настройки dnsmasq
-// отвечает и без podkop) — поэтому нужны оба признака.
+// Резолв через dnsmasq на 127.0.0.1 — единственный критерий «DNS смотрит в
+// туннель» (решение 10): dnsmasq держит состояние и в /tmp, поэтому по
+// /etc/config/dhcp судить нельзя. Наличие 127.0.0.42 в dhcp — подсказка для
+// текста отчёта (dns_config_points_to_podkop), на равенство не сравниваем.
 function dns_points_to_podkop() {
-	if (!dns_config_points_to_podkop())
-		return false;
 	return dns_resolves();
 }
 
 // Живой DNS без требования 127.0.0.42: после паузы dnsmasq должен отвечать
 // через провайдера, и это единственный признак, который видит клиент LAN.
+// Критерий тот же, что у туннеля, — резолв имени через 127.0.0.1.
 function dns_ok() {
-	return dns_resolves();
+	return dns_points_to_podkop();
 }
 
 // Слепок @dnsmasq[0]: server со 127.0.0.42, резервные копии podkop_* и
@@ -181,9 +185,14 @@ function dns_dirty(before, now) {
 // Вернуть dnsmasq провайдеру: `/usr/bin/podkop stop` вызывает dnsmasq_restore —
 // убирает server со 127.0.0.42, возвращает noresolv/cachesize и перезапускает
 // dnsmasq. Потом проверяем, что следов podkop не осталось и резолв живой.
+// `/usr/bin/podkop stop` — действие над podkop, поэтому идёт под общим локом.
 function restore_dns() {
 	let actions = [];
 	let errors = [];
+
+	if (!lock_acquire())
+		return { ok: false, busy: true, dns_ok: false, actions: actions,
+			errors: [ "другой запуск shoulderkop применяет настройки: dnsmasq не трогаю" ] };
 
 	let before = dns_state();
 	// трогаем dnsmasq, только если в нём действительно есть podkop
@@ -210,7 +219,8 @@ function restore_dns() {
 	if (!resolved)
 		push(errors, "dnsmasq на 127.0.0.1 не резолвит имена");
 
-	return { ok: ok, dns_ok: resolved, actions: actions, errors: errors };
+	lock_release();
+	return { ok: ok, busy: false, dns_ok: resolved, actions: actions, errors: errors };
 }
 
 function state() {
@@ -252,7 +262,17 @@ function locked() {
 	return lock_state() == "held";
 }
 
+// Сколько раз этот процесс взял лок: update/apply держат его на весь путь и
+// зовут restart_and_wait()/cleanup()/restore_dns() изнутри, а повторный mkdir
+// провалился бы на собственном локе.
+let lock_depth = 0;
+
 function lock_acquire() {
+	if (lock_depth > 0) {
+		lock_depth++;
+		return true;
+	}
+
 	for (let i = 0; i < 3; i++) {
 		let now_state = lock_state();
 		if (now_state == "held")
@@ -265,12 +285,19 @@ function lock_acquire() {
 			continue;
 
 		fs.writefile(LOCK + "/pid", own_pid());
+		lock_depth = 1;
 		return true;
 	}
 	return false;
 }
 
 function lock_release() {
+	if (lock_depth > 1) {
+		lock_depth--;
+		return;
+	}
+	lock_depth = 0;
+
 	let raw = fs.readfile(LOCK + "/pid");
 	if (raw != null && trim(raw) == own_pid())
 		quiet("rm -rf " + LOCK);
@@ -286,25 +313,90 @@ function restart_mark() {
 	return (raw == null) ? 0 : int(trim(raw));
 }
 
-// --- перезапуск ------------------------------------------------------------
+// --- ожидание готовности ----------------------------------------------------
+
+const READY_WAIT_MS = 25000;    // ожидание подъёма в одной попытке restart
+const READY_STEP_MS = 1000;     // шаг опроса
+const READY_STABLE_MS = 3000;   // столько готовность держится, чтобы ей поверить
+const READY_BUDGET_MS = 50000;  // общий бюджет ожидания: решение «не больше 50 с»
+const READY_ATTEMPTS = 2;       // больше двух перезапусков подряд — уже шторм
 
 function up_now() {
 	return tunnel_up() && singbox_running();
 }
 
-// restart + ожидание готовности. opts: { wait_ms = 25000, step_ms = 1000, attempts = 2 }
-function restart_and_wait(opts) {
+// Ожидание готовности: два стабильных замера подряд (таблица + процесс) с
+// паузой ≥3 с — одиночный замер ловит «только что появилось». Резолв через
+// dnsmasq проверяем в том же бюджете: он включается позже таблицы, но бюджет
+// ожидания не растягивает.
+// По умолчанию ждёт весь бюджет restart_and_wait() — этим же ожиданием
+// lifecycle.resume() поднимает туннель после продления подписки, и ждать
+// меньше, чем занимает перезапуск, нельзя.
+// opts: { wait_ms = READY_BUDGET_MS, step_ms = READY_STEP_MS }
+function wait_ready(opts) {
 	opts = opts || {};
-	let wait_ms = int("" + (opts.wait_ms == null ? 25000 : opts.wait_ms));
-	let step_ms = int("" + (opts.step_ms == null ? 1000 : opts.step_ms));
-	let attempts = int("" + (opts.attempts == null ? 2 : opts.attempts));
+	let wait_ms = int("" + (opts.wait_ms == null ? READY_BUDGET_MS : opts.wait_ms));
+	let step_ms = int("" + (opts.step_ms == null ? READY_STEP_MS : opts.step_ms));
+	// busybox sleep не обязан понимать доли секунды
+	if (step_ms < 1000)
+		step_ms = 1000;
+	let step_s = int(step_ms / 1000);
 	if (wait_ms < step_ms)
 		wait_ms = step_ms;
+
+	let wait_s = int(wait_ms / 1000);
+	if (wait_s < 1)
+		wait_s = 1;
+
+	let t0 = int("" + time());
+	let ready_at = -1;
+	let dns = false;
+
+	while (int("" + time()) - t0 < wait_s) {
+		if (up_now()) {
+			// запоминаем, когда туннель впервые увидели; пропал — начинаем заново
+			if (ready_at < 0)
+				ready_at = int("" + time());
+			else if (int("" + time()) - ready_at >= int(READY_STABLE_MS / 1000)) {
+				dns = dns_points_to_podkop();
+				if (dns)
+					break;
+			}
+		}
+		else {
+			ready_at = -1;
+		}
+		system("sleep " + step_s);
+	}
+
+	return {
+		ok: (ready_at >= 0 && dns),
+		waited: (int("" + time()) - t0) * 1000,
+		tunnel_up: tunnel_up(),
+		singbox_running: singbox_running(),
+		dns_ok: dns
+	};
+}
+
+// restart + ожидание готовности. opts: { wait_ms = 25000, step_ms = 1000,
+// attempts = 2, budget_ms = 50000 }. Общий бюджет ожидания (по умолчанию 50 с)
+// общий на все попытки: две попытки по 25 с — это уже предел, а не 56–62 с.
+// Лок берётся здесь же: пока update/apply пишет конфиг и перезапускает podkop,
+// диагностика не имеет права перезапустить его второй раз.
+function restart_and_wait(opts) {
+	opts = opts || {};
+	let wait_ms = int("" + (opts.wait_ms == null ? READY_WAIT_MS : opts.wait_ms));
+	let step_ms = int("" + (opts.step_ms == null ? READY_STEP_MS : opts.step_ms));
+	let attempts = int("" + (opts.attempts == null ? READY_ATTEMPTS : opts.attempts));
+	let budget_ms = int("" + (opts.budget_ms == null ? READY_BUDGET_MS : opts.budget_ms));
 	if (attempts < 1)
 		attempts = 1;
+	if (budget_ms < 1000)
+		budget_ms = 1000;
 
 	let result = {
 		ok: false,
+		busy: false,
 		attempts: 0,
 		waited: 0,
 		tunnel_up: false,
@@ -319,40 +411,42 @@ function restart_and_wait(opts) {
 		return result;
 	}
 
+	// лок занят — не делаем ничего: ни restart, ни nft, ни sing-box
+	if (!lock_acquire()) {
+		result.busy = true;
+		push(result.errors, "другой запуск shoulderkop применяет настройки: podkop не перезапускаю");
+		return result;
+	}
+
+	let t0 = int("" + time());
 	for (let i = 0; i < attempts; i++) {
+		if (budget_ms - (int("" + time()) - t0) * 1000 < 1000)
+			break;
+
 		result.attempts = i + 1;
 		push(result.actions, "podkop: restart (попытка " + result.attempts + ")");
 		quiet(PODKOP_INIT + " restart");
 		mark_restart();
 
-		// ждём таблицу и процесс; шаг округляем до секунд, потому что
-		// busybox sleep не обязан понимать доли секунды
-		let step_s = (step_ms >= 1000) ? int(step_ms / 1000) : 1;
-		let waited = 0;
-		while (waited < wait_ms) {
-			if (up_now())
-				break;
-			system("sleep " + step_s);
-			waited += step_s * 1000;
-		}
+		// остаток бюджета считаем после restart: сам restart тоже занимает время
+		let left_ms = budget_ms - (int("" + time()) - t0) * 1000;
+		if (left_ms < 1000)
+			left_ms = 1000;
 
-		// подъём podkop не мгновенный: два замера подряд с паузой ≥3 с, иначе
-		// ловим «только что появилось» и рапортуем готовность раньше времени
-		if (up_now()) {
-			system("sleep 3");
-			waited += 3000;
-		}
+		let w = wait_ready({
+			wait_ms: (wait_ms < left_ms) ? wait_ms : left_ms,
+			step_ms: step_ms
+		});
 
-		result.waited = waited;
-		result.tunnel_up = tunnel_up();
-		result.singbox_running = singbox_running();
-		result.dns_ok = dns_points_to_podkop();
-
-		if (result.tunnel_up && result.singbox_running && result.dns_ok) {
+		result.tunnel_up = w.tunnel_up;
+		result.singbox_running = w.singbox_running;
+		result.dns_ok = w.dns_ok;
+		if (w.ok && w.tunnel_up && w.singbox_running) {
 			result.ok = true;
 			break;
 		}
 	}
+	result.waited = (int("" + time()) - t0) * 1000;
 
 	if (!result.ok) {
 		if (!result.tunnel_up)
@@ -360,9 +454,13 @@ function restart_and_wait(opts) {
 		if (!result.singbox_running)
 			push(result.errors, "sing-box не запущен после restart");
 		if (!result.dns_ok)
-			push(result.errors, "dnsmasq не отвечает через podkop: нет 127.0.0.42 или резолв не работает");
+			push(result.errors, "dnsmasq на 127.0.0.1 не резолвит имена" +
+				(dns_config_points_to_podkop()
+					? " (127.0.0.42 в dhcp прописан, ответа нет)"
+					: " (127.0.0.42 в dhcp не прописан)"));
 	}
 
+	lock_release();
 	return result;
 }
 
@@ -437,7 +535,9 @@ function wait_singbox_gone(sec) {
 }
 
 // cleanup: снять остатки туннеля. opts: { force = true } — проверять и чистить
-// даже если podkop уже «остановлен».
+// даже если podkop уже «остановлен». Лок тот же, что у update/apply: иначе
+// cron-диагностика погасит sing-box и снесёт таблицу посреди чужой раскладки.
+// Возвращает проверенное состояние после чистки (tunnel_up, singbox_running).
 function cleanup(opts) {
 	opts = opts || {};
 	let force = (opts.force == true);
@@ -445,13 +545,22 @@ function cleanup(opts) {
 	let actions = [];
 	let errors = [];
 
+	// лок занят — не трогаем ни podkop, ни nft, ни sing-box
+	if (!lock_acquire())
+		return { ok: false, busy: true, actions: actions,
+			errors: [ "другой запуск shoulderkop применяет настройки: остатки туннеля не трогаю" ],
+			tunnel_up: null, singbox_running: null };
+
 	let table_existed = tunnel_up();
 	let box_was_running = singbox_running();
 	let had_rules = length(podkop_rules()) > 0;
 	let had_routes = route_table_has_entries();
 
-	if (!force && !table_existed && !box_was_running && !had_rules && !had_routes)
-		return { ok: true, actions: actions, errors: errors };
+	if (!force && !table_existed && !box_was_running && !had_rules && !had_routes) {
+		lock_release();
+		return { ok: true, busy: false, actions: actions, errors: errors,
+			tunnel_up: table_existed, singbox_running: box_was_running };
+	}
 
 	// 1. sing-box: только штатный stop и только если процесс наш, иначе
 	//    на паузе можно погасить чужой sing-box
@@ -490,7 +599,13 @@ function cleanup(opts) {
 			push(actions, "ip route: таблица " + RT_TABLE + " очищена");
 	}
 
-	return { ok: length(errors) == 0, actions: actions, errors: errors };
+	// 5. что осталось на самом деле — это и есть paused_clean в отчёте
+	let after_table = tunnel_up();
+	let after_box = singbox_running();
+
+	lock_release();
+	return { ok: length(errors) == 0, busy: false, actions: actions, errors: errors,
+		tunnel_up: after_table, singbox_running: after_box };
 }
 
 return {
@@ -501,6 +616,7 @@ return {
 	dns_ok: dns_ok,
 	restore_dns: restore_dns,
 	state: state,
+	wait_ready: wait_ready,
 	restart_and_wait: restart_and_wait,
 	cleanup: cleanup,
 	locked: locked,

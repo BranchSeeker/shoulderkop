@@ -26,10 +26,12 @@
 
 * `lifecycle.uc` — пауза/возврат туннеля, снимок состояния сервисов, снятие и возврат
   автозапуска (`suspend()` / `resume()` / `service_state()`); при паузе дополнительно
-  зовёт `podkopctl.cleanup({ force: true })`.
+  зовёт `podkopctl.cleanup({ force: true })`, а `resume()` ждёт подъёма тем же
+  ожиданием, что `restart_and_wait()`.
 * `podkopctl.uc` — единственное место, которое лезет в `/etc/init.d/podkop` и `nft`:
-  `restart_and_wait()` (перезапуск с ожиданием `tunnel_up`), `cleanup()` (снять sing-box
-  и таблицу `inet PodkopTable`), `tunnel_up()`, `dns_points_to_podkop()`.
+  `restart_and_wait()` (перезапуск с ожиданием `tunnel_up` и живого резолва; держит
+  файловый лок), `cleanup()` (снять sing-box и таблицу `inet PodkopTable`, тоже под
+  локом), `tunnel_up()`, `dns_points_to_podkop()`, `dns_ok()`, `wait_ready()`.
 * `apply.uc` — знает про секции podkop и списки, `engine_decode_link`; сам podkop не
   перезапускает.
 * `main.uc` — `shoulderkop update` (fetch → parse → apply → `restart_and_wait`),
@@ -58,8 +60,12 @@ cron/lock      →  каждые N минут лёгкая проверка
   `diag_full_interval` (по умолчанию час): внешние запросы, DNS-апстримы, узлы, туннель.
 * **Ремонт** — только по конкретным правилам (см. §5), с лимитом попыток и cooldown,
   чтобы не устраивать шторм перезапусков.
-* **Lock**: `flock /var/lock/shoulderkop-diag.lock` — демон и `shoulderkop update`
-  не должны работать одновременно (обновление подписки само дергает podkop).
+* **Lock**: файловый лок `podkopctl` — каталог `/tmp/shoulderkop.apply.lock` с pid
+  владельца (атомарный `mkdir`; `flock` в busybox есть не во всех сборках). Его
+  держат `update`/`apply` на весь путь «запись конфига podkop → restart → ожидание»,
+  а также `restart_and_wait()`, `cleanup()` и `restore_dns()`. Диагностика берёт тот
+  же лок на всю починку: занят — прогон пропускается с `reason: "apply lock busy"`,
+  и ни podkop, ни nft не трогаются.
 
 ## 4. Проверки
 
@@ -105,10 +111,15 @@ cron/lock      →  каждые N минут лёгкая проверка
 `reload` оставлял DNS провайдера — «первый запуск работает только после перезагрузки».
 
 Поэтому `main.uc` после `apply()` всегда зовёт `podkopctl.restart_and_wait()`:
-`/etc/init.d/podkop restart`, ожидание до 25 с (таблица `inet PodkopTable`, sing-box,
-`127.0.0.42` в dnsmasq), при неудаче — ещё одна попытка. Результат кладётся в отчёт:
-`tunnel_up`, `restart_attempts`, `reloaded`. Исключение — `diag` при смене DNS: там
-меняется только конфиг sing-box, dnsmasq уже настроен, и остаётся `reload`.
+`/etc/init.d/podkop restart`, затем ожидание готовности — **два стабильных замера
+подряд** (`tunnel_up && singbox_running`) с паузой ≥3 с. Готовность одной попытки —
+до 25 с, попыток не больше двух, **общий бюджет ожидания ≤50 с** (две попытки по 25 с,
+а не 25 + 3 + резолв на каждую). DNS проверяется живым резолвом через `127.0.0.1`
+(dig, иначе nslookup): `127.0.0.42` в `/etc/config/dhcp` — подсказка для текста, а не
+критерий, потому что dnsmasq держит состояние и в `/tmp`. Результат кладётся в отчёт:
+`tunnel_up`, `dns_points_to_podkop`, `dns_ok`, `internet_ok`, `restart_attempts`,
+`reloaded`, `paused_clean`. Исключение — `diag` при смене DNS: там меняется только
+конфиг sing-box, dnsmasq уже настроен, и остаётся `reload`.
 
 ### 5.2. Пауза по истёкшей подписке
 
@@ -125,7 +136,9 @@ cron/lock      →  каждые N минут лёгкая проверка
 Поэтому `lifecycle.suspend()` после `disable` зовёт `podkop stop` (init и напрямую),
 затем `podkopctl.cleanup({ force: true })` — останавливает sing-box, удаляет
 `inet PodkopTable`, снимает `ip rule`/маршруты podkop — и проверяет результат.
-В отчёт пишутся `paused_clean` и `internet_ok`.
+В отчёт пишутся `paused_clean`, `tunnel_up`, `dns_ok` и `internet_ok`, причём
+`paused_clean`/`tunnel_up` берутся из проверенного результата `cleanup()`, а не из
+повторного опроса: именно он снимал таблицу и гасил sing-box.
 
 ## 6. DNS: лестница приоритетов
 
@@ -180,11 +193,38 @@ DoT + UDP. Если у провайдера когда-нибудь зарабо
 
 * `shoulderkop diag` — прогнать сейчас, печать отчёта по-человечески.
 * `shoulderkop diag --json` — машинный отчёт (для LuCI).
-* `shoulderkop status` — добавляем блок `diag: { ts, ok, failed: [...], repairs: [...] }`.
+* `shoulderkop status` — печатает поля последнего отчёта `update`/`apply` плюс
+  `suspended`, `suspended_at`, `suspended_init`, `suspended_running`, `services`,
+  `self_update` и блок диагностики `diag: { enabled, interval, level, direct, last,
+  history_len }` (`last` — последний отчёт диагностики, он же пишется в `/tmp`).
 * LuCI: блок «Диагностика» — время последней проверки, галочки/крестики по пунктам,
   кнопка «Проверить сейчас», поле интервала (только если `diag_enabled`).
 * Cron-строка отдельная от обновления подписки, чтобы не блокировать друг друга
   дольше, чем на время lock.
+
+### 8.1. Поля отчёта `update`/`apply` (и их же печатает `status`)
+
+```
+updated, status, count, mode, lan, engine_decode_link, service, reloaded,
+applied[], removed[], rebuilt, errors[], warnings[], actions[], userinfo,
+checked[], suspended, suspended_at, resumed, resume_actions[], direct_left,
+tunnel_up, dns_points_to_podkop, dns_ok, internet_ok, paused_clean,
+restart_attempts
+```
+
+| Поле | Откуда берётся |
+| --- | --- |
+| `status` | `active` / `expired` / `error` / `busy` (лок занят — ничего не делали) |
+| `tunnel_up` | результат `restart_and_wait()` / `cleanup()` / ожидания в `resume()` |
+| `dns_points_to_podkop`, `dns_ok` | живой резолв через `127.0.0.1` из того же результата; в отчёте паузы — что dnsmasq отвечает уже через провайдера |
+| `internet_ok` | HTTP 204 с `https://www.gstatic.com/generate_204` (и в отчёте паузы тоже) |
+| `paused_clean` | `cleanup()` + `restore_dns()`: nft снят, sing-box нет, dnsmasq возвращён |
+| `restart_attempts` | сколько перезапусков podkop сделал `restart_and_wait()` (0…2) |
+| `reloaded` | `true`, если перезапуск вообще был |
+
+Пока действий не было (`status: error`/`busy`, туннель не трогали), `tunnel_up`,
+`dns_points_to_podkop`, `dns_ok`, `internet_ok` и `paused_clean` — `null`: состояние
+«до» за результат действий не выдаётся.
 
 ## 9. Границы
 
@@ -217,8 +257,8 @@ DoT + UDP. Если у провайдера когда-нибудь зарабо
 10. **История**: хранить последние N результатов в `/tmp` (переживает только до
     перезагрузки) или писать в `/etc/shoulderkop/diag.log` (износ flash)?
 11. **Ручной запуск**: нужна ли кнопка «Проверить сейчас» в LuCI, или достаточно CLI?
-12. **Hotplug**: дёргать проверку на `ifup wan` (полезно для LTE, где WAN
-    переподключается часто) — включаем?
+12. **Hotplug**: дёргать проверку на `ifup wan` — WAN переподключается после
+    перезагрузки роутера и после смены провайдера; включаем?
 
 
 ## 11. Принятые решения

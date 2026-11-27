@@ -298,6 +298,11 @@ function restart_podkop(l, actions, errors) {
 		return false;
 	}
 	let r = podkopctl.restart_and_wait({ wait_ms: 15000, attempts: 1 });
+	if (r.busy == true) {
+		// лок занял чужой apply/update: попыткой не считаем, podkop не тронут
+		push(actions, "podkop: не перезапускаю — другой запуск применяет настройки");
+		return false;
+	}
 	took_restart(l);
 	l.last_restart = time();
 	limits_save(l);
@@ -532,6 +537,68 @@ function after_update() {
 	return { left_direct: false, actions: actions };
 }
 
+// Починка в рабочем режиме: автозапуск, перезапуск, DNS-лестница, direct.
+// Вызывается только под локом и только когда после перезапуска прошло больше
+// RESTART_COOLDOWN — иначе её шаги наложатся на чужой apply/update.
+function repair_tunnel(l, actions, errors, opts) {
+	let direct = cfg_bool("direct_mode", false);
+
+	// 1. автозапуск podkop снят — возвращаем (это и есть «интернет пропал
+	//    после ребута»), если не в direct-режиме
+	if (!podkop_enabled() && !direct) {
+		quiet(PODKOP + " enable");
+		push(actions, "podkop: автозапуск включён");
+	}
+
+	// 2. сервис не поднят / nft нет — перезапускаем и ждём готовности
+	let cooling = false;
+	if (!podkopctl.singbox_running() || !podkopctl.tunnel_up())
+		if (restart_podkop(l, actions, errors))
+			cooling = true;
+
+	if (cooling) {
+		push(actions, "podkop перезапущен: " + RESTART_COOLDOWN + " с не трогаем — туннель поднимается");
+		return;
+	}
+
+	// 3. все узлы мертвы — держать podkop включённым нельзя: он душит
+	//    интернет и ломает загрузку rule-set'ов podkop. Переводим всё
+	//    в direct, пока не появятся живые серверы.
+	if (!internet_ok() && !direct && (podkopctl.singbox_running() || podkopctl.tunnel_up())) {
+		system("sleep 3");
+		let na = nodes_alive();
+		if (na == 0) {
+			push(actions, "все узлы мертвы — перевожу всё в direct");
+			to_direct(l, actions);
+			direct = cfg_bool("direct_mode", false);
+		} else if (na == 1) {
+			push(actions, "узлы живы — проблема не в серверах");
+		}
+	}
+
+	// 4. интернета всё ещё нет — спускаемся по DNS-лестнице до первой
+	//    рабочей ступени (DoH → DoT → UDP 77.88.8.8)
+	if (!internet_ok() && !direct) {
+		let lvl = dns_level_get();
+		let from = (lvl >= 0) ? lvl + 1 : 0;
+		let next = first_working_from(from);
+		if (next < 0 && from > 0)
+			next = first_working_from(0);
+		if (next >= 0)
+			set_dns_level(next, l, actions);
+		else
+			push(actions, "dns: ни одна ступень не отвечает — проблема не в DNS");
+	}
+
+	// 5. последний рубеж — direct, чтобы LAN не остался без сети совсем
+	if (!internet_ok() && !direct)
+		to_direct(l, actions);
+
+	// 6. direct и узлы снова живы — возвращаемся в туннель
+	if (cfg_bool("direct_mode", false) && internet_ok() && opts.resume == true)
+		from_direct(l, actions);
+}
+
 function run(opts) {
 	opts = opts || {};
 	let quick = (opts.quick == true);
@@ -582,73 +649,43 @@ function run(opts) {
 
 	if (!quick && cfg_bool("diag_repair", true) && !cooling) {
 		if (paused) {
-			// на паузе чиним только в сторону снятия (см. repair_paused)
-			if (repair_paused(actions, errors)) {
-				checks = run_checks(false, true);
-				bad = failed(checks);
+			// на паузе чиним только в сторону снятия (см. repair_paused); чистка
+			// трогает podkop и dnsmasq, поэтому идёт под общим локом
+			if (podkopctl.lock_acquire()) {
+				try {
+					repair_paused(actions, errors);
+				} catch (e) {
+					push(errors, "починка: " + "" + e);
+				}
+				podkopctl.lock_release();
 			}
+			else
+				push(actions, "починка пропущена: другой запуск применяет настройки");
+
+			checks = run_checks(false, true);
+			bad = failed(checks);
 		}
 		else if (init_exists("podkop")) {
-			let direct = cfg_bool("direct_mode", false);
-
-			// 0. интернета нет, а мы в туннеле: возможно, панель уже выдала другие
-			//    узлы — подтягиваем подписку (не чаще раза в 30 минут). Update сам
-			//    перезапускает podkop, поэтому дальше даём туннелю подняться.
-			if (!internet_ok() && !direct && refresh_subscription(l, actions))
+			// подписку обновляем до лока: `shoulderkop update` берёт его сам
+			if (!cfg_bool("direct_mode", false) && !internet_ok() &&
+				refresh_subscription(l, actions))
 				cooling = restart_recently(l);
-
-			// 1. автозапуск podkop снят — возвращаем (это и есть «интернет пропал
-			//    после ребута»), если не в direct-режиме
-			if (!cooling && !podkop_enabled() && !direct) {
-				quiet(PODKOP + " enable");
-				push(actions, "podkop: автозапуск включён");
-			}
-
-			// 2. сервис не поднят / nft нет — перезапускаем и ждём готовности
-			if (!cooling && (!podkopctl.singbox_running() || !podkopctl.tunnel_up()))
-				if (restart_podkop(l, actions, errors))
-					cooling = true;
 
 			if (cooling) {
 				push(actions, "podkop перезапущен: " + RESTART_COOLDOWN + " с не трогаем — туннель поднимается");
 			}
+			else if (podkopctl.lock_acquire()) {
+				// лок тот же, что у update/apply: пока там идёт раскладка,
+				// диагностика не перезапускает podkop и не гасит его
+				try {
+					repair_tunnel(l, actions, errors, opts);
+				} catch (e) {
+					push(errors, "починка: " + "" + e);
+				}
+				podkopctl.lock_release();
+			}
 			else {
-				// 3. все узлы мертвы — держать podkop включённым нельзя: он душит
-				//    интернет и ломает загрузку rule-set'ов podkop. Переводим всё
-				//    в direct, пока не появятся живые серверы.
-				if (!internet_ok() && !direct && (podkopctl.singbox_running() || podkopctl.tunnel_up())) {
-					system("sleep 3");
-					let na = nodes_alive();
-					if (na == 0) {
-						push(actions, "все узлы мертвы — перевожу всё в direct");
-						to_direct(l, actions);
-						direct = cfg_bool("direct_mode", false);
-					} else if (na == 1) {
-						push(actions, "узлы живы — проблема не в серверах");
-					}
-				}
-
-				// 4. интернета всё ещё нет — спускаемся по DNS-лестнице до первой
-				//    рабочей ступени (DoH → DoT → UDP 77.88.8.8)
-				if (!internet_ok() && !direct) {
-					let lvl = dns_level_get();
-					let from = (lvl >= 0) ? lvl + 1 : 0;
-					let next = first_working_from(from);
-					if (next < 0 && from > 0)
-						next = first_working_from(0);
-					if (next >= 0)
-						set_dns_level(next, l, actions);
-					else
-						push(actions, "dns: ни одна ступень не отвечает — проблема не в DNS");
-				}
-
-				// 5. последний рубеж — direct, чтобы LAN не остался без сети совсем
-				if (!internet_ok() && !direct)
-					to_direct(l, actions);
-
-				// 6. direct и узлы снова живы — возвращаемся в туннель
-				if (cfg_bool("direct_mode", false) && internet_ok() && opts.resume == true)
-					from_direct(l, actions);
+				push(actions, "починка пропущена: другой запуск применяет настройки");
 			}
 
 			checks = run_checks(false, false);
