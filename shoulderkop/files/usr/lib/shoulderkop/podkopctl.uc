@@ -349,15 +349,23 @@ function wait_ready(opts) {
 		wait_s = 1;
 
 	let t0 = int("" + time());
+	let deadline = t0 + wait_s;
+	// Сколько максимум занимает проверка резолва: dig ограничен +timeout=3, а
+	// nslookup — две попытки по 5 с. Начинать её, не оставив этого запаса,
+	// значит вылезти за бюджет ожидания.
+	let probe_s = have_dig() ? 3 : 10;
 	let ready_at = -1;
 	let dns = false;
 
-	while (int("" + time()) - t0 < wait_s) {
+	while (int("" + time()) < deadline) {
 		if (up_now()) {
 			// запоминаем, когда туннель впервые увидели; пропал — начинаем заново
 			if (ready_at < 0)
 				ready_at = int("" + time());
 			else if (int("" + time()) - ready_at >= int(READY_STABLE_MS / 1000)) {
+				// резолв проверяем, только если на него хватает остатка бюджета
+				if (deadline - int("" + time()) < probe_s)
+					break;
 				dns = dns_points_to_podkop();
 				if (dns)
 					break;
@@ -366,7 +374,12 @@ function wait_ready(opts) {
 		else {
 			ready_at = -1;
 		}
-		system("sleep " + step_s);
+
+		// и спим не дольше остатка: иначе последний шаг вылезет за дедлайн
+		let left_s = deadline - int("" + time());
+		if (left_s <= 0)
+			break;
+		system("sleep " + ((step_s < left_s) ? step_s : left_s));
 	}
 
 	return {

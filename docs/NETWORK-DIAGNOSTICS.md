@@ -218,13 +218,13 @@ restart_attempts
 | `tunnel_up` | результат `restart_and_wait()` / `cleanup()` / ожидания в `resume()` |
 | `dns_points_to_podkop`, `dns_ok` | живой резолв через `127.0.0.1` из того же результата; в отчёте паузы — что dnsmasq отвечает уже через провайдера |
 | `internet_ok` | HTTP 204 с `https://www.gstatic.com/generate_204` (и в отчёте паузы тоже) |
-| `paused_clean` | `cleanup()` + `restore_dns()`: nft снят, sing-box нет, dnsmasq возвращён |
+| `paused_clean` | `cleanup()` + `restore_dns()`: nft снят, sing-box нет, dnsmasq возвращён; `null` — паузы в этом запуске не было, `false` — пауза была, чистка не удалась |
 | `restart_attempts` | сколько перезапусков podkop сделал `restart_and_wait()` (0…2) |
 | `reloaded` | `true`, если перезапуск вообще был |
 
 Пока действий не было (`status: error`/`busy`, туннель не трогали), `tunnel_up`,
-`dns_points_to_podkop`, `dns_ok`, `internet_ok` и `paused_clean` — `null`: состояние
-«до» за результат действий не выдаётся.
+`dns_points_to_podkop`, `dns_ok` и `internet_ok` — `null`: состояние «до» за результат
+действий не выдаётся. `paused_clean` — `null` всегда, когда паузы в запуске не было.
 
 ## 9. Границы
 

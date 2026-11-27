@@ -580,7 +580,9 @@ function apply_nodes(nodes, errors, warnings, opts) {
 		errors: errors,
 		warnings: warnings,
 		restart_attempts: 0,
-		paused_clean: false
+		// паузы в этом запуске не было — чистить было нечего: null, а не false
+		// (false значит «пауза была, но чистка не удалась»)
+		paused_clean: null
 	};
 	return tunnel_report(r, null, null);
 }
