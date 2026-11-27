@@ -3,8 +3,11 @@
 // Когда подписка истекла, shoulderkop:
 //   1. запоминает, что было включено/запущено (podkop, sing-box);
 //   2. снимает автозапуск podkop и sing-box (rc.d-симлинки);
-//   3. останавливает podkop (он сам гасит sing-box, nft и возвращает dnsmasq);
-//   4. ставит в UCI settings.suspended=1.
+//   3. останавливает podkop (init и напрямую: procd гасит инстанс только если
+//      он его запускал, а после reload инстанса нет);
+//   4. добивает остатки через podkopctl.cleanup({force:true}) — sing-box,
+//      таблицу inet PodkopTable, ip rule и таблицу маршрутов podkop;
+//   5. ставит в UCI settings.suspended=1.
 //
 // Cron-задача shoulderkop при этом остаётся: следующий `update` снова сходит
 // в подписку. Как только панель отдаст настоящие серверы, resume() вернёт
@@ -16,8 +19,10 @@
 
 let fs = require("fs");
 let uci = require("uci");
+let podkopctl = require("podkopctl");
 
 const PODKOP = "/etc/init.d/podkop";
+const PODKOP_BIN = "/usr/bin/podkop";
 const SINGBOX = "/etc/init.d/sing-box";
 const CONFIG = "shoulderkop";
 const SECTION = "settings";
@@ -53,22 +58,6 @@ function init_exists(name) {
 // rc.common enabled: ищем S-симлинк в /etc/rc.d (START может быть разным)
 function is_enabled(name) {
 	return trim(sh("ls /etc/rc.d/S*" + name + " 2>/dev/null")) != "";
-}
-
-// [s]ing-box — чтобы pgrep не нашёл сам себя и `sh -c`, в чьей командной
-// строке иначе был бы тот же шаблон (иначе проверка всегда давала бы true).
-// Запасной вариант — pidof: на некоторых сборках busybox pgrep выключен,
-// а ядро из compressed-сборки называется sing-box-core.
-function is_running() {
-	if (trim(sh("pgrep -f '[s]ing-box[^ ]* run' 2>/dev/null")) != "")
-		return true;
-	return trim(sh("pidof sing-box 2>/dev/null")) != "" ||
-		trim(sh("pidof sing-box-core 2>/dev/null")) != "";
-}
-
-// Правила podkop в nft живут, пока туннель поднят
-function tunnel_up() {
-	return trim(sh("nft list table inet PodkopTable 2>/dev/null")) != "";
 }
 
 function as_list(v) {
@@ -130,8 +119,8 @@ function suspend() {
 	// восстанавливаем только если podkop не использовался.
 	let podkop_on = init_exists("podkop") && is_enabled("podkop");
 	let singbox_on = init_exists("sing-box") && is_enabled("sing-box");
-	let running = is_running();
-	let tunnel = tunnel_up();
+	let running = podkopctl.singbox_running();
+	let tunnel = podkopctl.tunnel_up();
 	let used_podkop = init_exists("podkop") && (tunnel || (running && podkop_on));
 	let used_singbox = !used_podkop && init_exists("sing-box") && running;
 
@@ -184,9 +173,11 @@ function suspend() {
 		c.commit(CONFIG);
 	}
 
-	// Сначала podkop: его stop сам останавливает sing-box и чистит nft
+	// Сначала podkop: init останавливает procd-инстанс, прямой вызов нужен,
+	// когда инстанса нет (после reload) — он же вернёт dnsmasq провайдеру
 	if (used_podkop) {
 		quiet(PODKOP + " stop");
+		quiet(PODKOP_BIN + " stop");
 		push(actions, "podkop: остановлен");
 	}
 	else if (used_singbox) {
@@ -194,32 +185,17 @@ function suspend() {
 		push(actions, "sing-box: остановлен");
 	}
 
-	// Гашение идёт через procd и может быть не мгновенным — ждём до ~10 секунд,
-	// иначе статус врал бы «sing-box всё ещё работает».
-	if (used_podkop || used_singbox) {
-		for (let i = 0; i < 10; i++) {
-			if (!is_running())
-				break;
-			system("sleep 1");
-		}
-	}
+	// Остатки туннеля снимаем явно: procd-инстанс podkop мог не существовать,
+	// и тогда stop ничего не почистил. cleanup проверяет, что вышло.
+	let cl = podkopctl.cleanup({ force: true });
+	for (let a in cl.actions)
+		push(actions, a);
+	for (let e in cl.errors)
+		push(errors, e);
 
-	// Если sing-box всё ещё жив (например, запускался не через podkop) — добиваем
-	if (init_exists("sing-box") && is_running()) {
-		quiet(SINGBOX + " stop");
-		push(actions, "sing-box: остановлен");
-		system("sleep 1");
-	}
-
-	// Страховка: если sing-box уже нет, а nft-правила остались, трафик
-	// уходил бы в мёртвый tproxy — сносим таблицу
-	if (!is_running() && tunnel_up()) {
-		quiet("nft delete table inet PodkopTable");
-		push(actions, "nft: таблица PodkopTable удалена");
-	}
-
-	if (is_running())
-		push(errors, "sing-box всё ещё работает после паузы");
+	let paused_clean = (cl.ok && !podkopctl.singbox_running() && !podkopctl.tunnel_up());
+	if (!paused_clean && length(errors) == 0)
+		push(errors, "после паузы остались следы туннеля");
 
 	let info = suspended_info();
 	return {
@@ -229,7 +205,8 @@ function suspend() {
 		errors: errors,
 		at: info.at,
 		init: init_list,
-		running: run_list
+		running: run_list,
+		paused_clean: paused_clean
 	};
 }
 
@@ -276,10 +253,10 @@ function resume() {
 	if (length(started) > 0) {
 		for (let i = 0; i < 15; i++) {
 			system("sleep 1");
-			if (is_running() || tunnel_up())
+			if (podkopctl.singbox_running() || podkopctl.tunnel_up())
 				break;
 		}
-		if (!is_running() && !tunnel_up())
+		if (!podkopctl.singbox_running() && !podkopctl.tunnel_up())
 			push(errors, "podkop/sing-box не поднялись после активации подписки");
 	}
 
@@ -309,8 +286,8 @@ function service_state() {
 		podkop_enabled: is_enabled("podkop"),
 		singbox_installed: init_exists("sing-box"),
 		singbox_enabled: is_enabled("sing-box"),
-		singbox_running: is_running(),
-		tunnel_up: tunnel_up()
+		singbox_running: podkopctl.singbox_running(),
+		tunnel_up: podkopctl.tunnel_up()
 	};
 }
 

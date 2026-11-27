@@ -7,6 +7,10 @@
 // починка: автозапуск podkop, перезапуск, спуск по DNS-лестнице, а при полном
 // отсутствии живых узлов — перевод всего в direct.
 //
+// Отдельно — пауза подписки: podkop выключен, sing-box и nft должны быть сняты.
+// При паузе проверяем ровно этот инвариант и чиним только в сторону снятия:
+// никогда не поднимаем podkop и не включаем его автозапуск.
+//
 // Всё, что можно, переиспользуем у podkop: `podkop check_dns_available`,
 // `podkop get_status`, `podkop reload`. Своё — только оркестрация, лимиты и
 // история проверок (последние 10 в /tmp).
@@ -15,6 +19,7 @@
 
 let fs = require("fs");
 let uci = require("uci");
+let podkopctl = require("podkopctl");
 
 const CONFIG = "shoulderkop";
 const SECTION = "settings";
@@ -26,7 +31,7 @@ const HISTORY_MAX = 10;
 
 const GSTATIC = "https://www.gstatic.com/generate_204";
 const PODKOP = "/etc/init.d/podkop";
-const SINGBOX = "/etc/init.d/sing-box";
+const PODKOP_BIN = "/usr/bin/podkop";
 
 // DNS-лестница: от лучшего варианта к худшему, только IP — чтобы проверка и
 // работа DNS не зависели от того, резолвится ли чьё-то имя (когда DNS и сломан,
@@ -46,10 +51,13 @@ const LADDER = [
 ];
 
 // лимиты: перезапускаем podkop не чаще 3 раз за 30 минут, DNS меняем не чаще
-// раза в 10 минут, direct включаем/выключаем не чаще раза в 10 минут
+// раза в 10 минут, direct включаем/выключаем не чаще раза в 10 минут.
+// После перезапуска podkop туннель поднимается 25–50 с — в это время ничего
+// не чиним, иначе только что поднятый туннель читается как «интернета нет».
 const RESTART_MAX = 3;
 const RESTART_WINDOW = 1800;
 const SWITCH_COOLDOWN = 600;
+const RESTART_COOLDOWN = 60;
 
 let sh_seq = 0;
 
@@ -121,17 +129,6 @@ function init_exists(init) {
 	return fs.stat("/etc/init.d/" + init) != null;
 }
 
-function singbox_running() {
-	if (trim(sh("pgrep -f '[s]ing-box[^ ]* run' 2>/dev/null")) != "")
-		return true;
-	return trim(sh("pidof sing-box 2>/dev/null")) != "" ||
-		trim(sh("pidof sing-box-core 2>/dev/null")) != "";
-}
-
-function tunnel_up() {
-	return trim(sh("nft list table inet PodkopTable 2>/dev/null")) != "";
-}
-
 function http_code(url, extra) {
 	return trim(sh("curl -s -m 8 -o /dev/null -w '%{http_code}' " +
 		((extra != null) ? extra : "") + " '" + url + "'"));
@@ -193,10 +190,6 @@ function podkop_enabled() {
 	return init_exists("podkop") && is_enabled("podkop");
 }
 
-function nft_ok() {
-	return tunnel_up();
-}
-
 // Живы ли узлы. Спрашиваем у самого podkop через Clash API: у нативной
 // urltest-секции группа называется "<section>-urltest-out", у синтетической
 // (outbound_json) — "<section>-out". Обе умеют мерить задержку.
@@ -243,7 +236,9 @@ function nodes_alive() {
 }
 
 // Обновить подписку перед починкой: панель могла выдать другие узлы, а старые
-// уже мертвы. Не чаще раза в 30 минут, чтобы не долбить панель.
+// уже мертвы. Не чаще раза в 30 минут, чтобы не долбить панель. Сам update
+// перезапускает podkop и ставит метку перезапуска — после него даём туннелю
+// подняться, а не чиним сразу.
 function refresh_subscription(l, actions) {
 	let now = time();
 	if (now - int(l.last_update || 0) < 1800)
@@ -255,17 +250,6 @@ function refresh_subscription(l, actions) {
 	return true;
 }
 
-function podkop_state() {
-	let raw = trim(sh("/usr/bin/podkop get_status 2>/dev/null"));
-	if (raw == "")
-		return null;
-	try {
-		return json(raw);
-	} catch (e) {
-		return null;
-	}
-}
-
 function limits_load() {
 	let l = read_json(LIMITS, null);
 	if (type(l) != "object")
@@ -273,6 +257,7 @@ function limits_load() {
 	l.restarts = l.restarts || [];
 	l.last_dns = l.last_dns || 0;
 	l.last_direct = l.last_direct || 0;
+	l.last_restart = l.last_restart || 0;
 	return l;
 }
 
@@ -295,7 +280,16 @@ function took_restart(l) {
 	limits_save(l);
 }
 
-function restart_podkop(l, actions) {
+// podkop мог перезапуститься не нами (update в cron): podkopctl пишет метку,
+// по ней диагностика тоже выдерживает паузу после перезапуска
+function restart_recently(l) {
+	let now = time();
+	if (now - podkopctl.restart_mark() < RESTART_COOLDOWN)
+		return true;
+	return (now - int("" + (l.last_restart || 0)) < RESTART_COOLDOWN);
+}
+
+function restart_podkop(l, actions, errors) {
 	if (!init_exists("podkop"))
 		return false;
 	if (!can_restart(l)) {
@@ -303,12 +297,21 @@ function restart_podkop(l, actions) {
 			RESTART_MAX + " за " + (RESTART_WINDOW / 60) + " мин)");
 		return false;
 	}
-	quiet(PODKOP + " restart");
+	let r = podkopctl.restart_and_wait({ wait_ms: 15000, attempts: 1 });
 	took_restart(l);
-	push(actions, "podkop: перезапущен");
+	l.last_restart = time();
+	limits_save(l);
+	if (r.ok)
+		push(actions, "podkop: перезапущен");
+	else {
+		push(actions, "podkop: перезапущен, но туннель не поднялся");
+		for (let e in r.errors)
+			push(errors, e);
+	}
 	return true;
 }
 
+// Перевод в direct: podkop выключен, DNS возвращён провайдеру, остатки сняты.
 function to_direct(l, actions) {
 	let now = time();
 	if (now - int(l.last_direct) < SWITCH_COOLDOWN) {
@@ -320,7 +323,16 @@ function to_direct(l, actions) {
 
 	quiet(PODKOP + " disable");
 	quiet(PODKOP + " stop");
-	quiet("nft delete table inet PodkopTable");
+	// прямой stop нужен, когда procd-инстанса нет: он возвращает dnsmasq
+	// провайдеру, иначе LAN останется без DNS
+	quiet(PODKOP_BIN + " stop");
+
+	let cl = podkopctl.cleanup({ force: true });
+	for (let a in cl.actions)
+		push(actions, a);
+	for (let e in cl.errors)
+		push(actions, "cleanup: " + e);
+
 	cfg_set("direct_mode", "1");
 	push(actions, "все узлы недоступны: podkop остановлен, трафик идёт напрямую (direct)");
 	return true;
@@ -337,7 +349,22 @@ function from_direct(l, actions) {
 
 	if (init_exists("podkop"))
 		quiet(PODKOP + " enable");
-	quiet(PODKOP + " start");
+
+	if (!init_exists("podkop")) {
+		cfg_set("direct_mode", "0");
+		return false;
+	}
+
+	let r = podkopctl.restart_and_wait({ wait_ms: 15000, attempts: 1 });
+	l.last_restart = time();
+	limits_save(l);
+	if (!r.ok) {
+		for (let e in r.errors)
+			push(actions, "podkop: " + e);
+		push(actions, "direct: туннель не поднялся — остаёмся напрямую");
+		return false;
+	}
+
 	cfg_set("direct_mode", "0");
 	push(actions, "узлы снова живы: podkop включён, возвращаемся в туннель");
 	return true;
@@ -363,6 +390,8 @@ function set_dns_level(i, l, actions) {
 	cfg_set("dns_level", "" + i);
 	push(actions, "dns: переключён на " + e.type + " " + e.server + " (ступень " + (i + 1) + ")");
 
+	// здесь меняется только конфиг sing-box: dnsmasq уже настроен podkop'ом,
+	// поэтому reload достаточно (restart настраивал бы dnsmasq заново)
 	if (init_exists("podkop"))
 		quiet(PODKOP + " reload");
 	return true;
@@ -384,14 +413,21 @@ function run_checks(quick, paused) {
 	if (quick)
 		return checks;
 
-	add("podkop", podkop_enabled(), podkop_enabled() ? "автозапуск включён" : "автозапуск выключен");
-	// при истёкшей подписке lifecycle штатно гасит podkop: sing-box и nft
-	// отсутствуют намеренно, это не поломка
-	if (paused)
-		return checks;
+	let box = podkopctl.singbox_running();
+	let table = podkopctl.tunnel_up();
 
-	add("sing-box", singbox_running(), singbox_running() ? "процесс работает" : "процесс не найден");
-	add("nft", nft_ok(), nft_ok() ? "таблица PodkopTable есть" : "таблицы PodkopTable нет");
+	// Пауза подписки: lifecycle штатно погасил podkop, sing-box и nft сняты.
+	// Автозапуск podkop при паузе не проверяем и не включаем — иначе вернём
+	// туннель с истёкшей подпиской и оставим LAN без интернета.
+	if (paused) {
+		add("sing-box", !box, box ? "процесс работает, а при паузе его быть не должно" : "процесс не найден");
+		add("nft", !table, table ? "таблица PodkopTable есть, а при паузе её быть не должно" : "таблицы PodkopTable нет");
+		return checks;
+	}
+
+	add("podkop", podkop_enabled(), podkop_enabled() ? "автозапуск включён" : "автозапуск выключен");
+	add("sing-box", box, box ? "процесс работает" : "процесс не найден");
+	add("nft", table, table ? "таблица PodkopTable есть" : "таблицы PodkopTable нет");
 
 	let cur = current_dns();
 	let lvl = dns_level_get();
@@ -404,6 +440,20 @@ function run_checks(quick, paused) {
 	}
 
 	return checks;
+}
+
+// Починка при паузе: только снятие. Никакого enable/start — podkop должен
+// остаться выключенным, пока подписка не станет активной снова.
+function repair_paused(actions, errors) {
+	if (!podkopctl.singbox_running() && !podkopctl.tunnel_up())
+		return false;
+
+	let r = podkopctl.cleanup({ force: true });
+	for (let a in r.actions)
+		push(actions, a);
+	for (let e in r.errors)
+		push(errors, e);
+	return true;
 }
 
 function failed(checks) {
@@ -464,6 +514,11 @@ function run(opts) {
 	if (!cfg_bool("diag_enabled", true) && !force)
 		return { skipped: true, reason: "diag_enabled=0" };
 
+	// update/apply держит лок на всё время «конфиг podkop → restart → ожидание»:
+	// в это окно мерить и чинить нечего, только мешать
+	if (podkopctl.locked())
+		return { skipped: true, reason: "apply lock busy" };
+
 	let l = limits_load();
 	let started = time();
 	let actions = [];
@@ -472,6 +527,10 @@ function run(opts) {
 	// подписка на паузе (истекла): lifecycle специально погасил podkop и снял
 	// автозапуск — не «чиним» это обратно, иначе диагностика воевала бы с паузой
 	let paused = (cfg("suspended", "0") == "1");
+
+	// сразу после перезапуска podkop туннель ещё поднимается: 60 с не чиним
+	// и не переводим всё в direct, иначе успешный update читается как авария
+	let cooling = restart_recently(l);
 
 	let checks = run_checks(quick, paused);
 	let bad = failed(checks);
@@ -493,64 +552,80 @@ function run(opts) {
 
 	log_msg("проблема: " + join(", ", bad));
 
-	if (!quick && init_exists("podkop") && !paused && cfg_bool("diag_repair", true)) {
-		let direct = cfg_bool("direct_mode", false);
-
-		// 0. интернета нет, а мы в туннеле: возможно, панель уже выдала другие
-		//    узлы — подтягиваем подписку (не чаще раза в 30 минут)
-		if (!internet_ok() && !direct)
-			refresh_subscription(l, actions);
-
-		// 1. автозапуск podkop снят — возвращаем (это и есть «интернет пропал
-		//    после ребута»), если не в direct-режиме
-		if (!podkop_enabled() && !direct) {
-			quiet(PODKOP + " enable");
-			push(actions, "podkop: автозапуск включён");
-		}
-
-		// 2. сервис не поднят / nft нет — перезапускаем
-		if (!singbox_running() || !nft_ok())
-			restart_podkop(l, actions);
-
-		// 3. все узлы мертвы — держать podkop включённым нельзя: он душит
-		//    интернет и ломает загрузку rule-set'ов (geoip.srs и т.п.).
-		//    Переводим всё в direct, пока не появятся живые серверы.
-		if (!internet_ok() && !direct && (singbox_running() || nft_ok())) {
-			system("sleep 3");
-			let na = nodes_alive();
-			if (na == 0) {
-				push(actions, "все узлы мертвы — перевожу всё в direct");
-				to_direct(l, actions);
-				direct = cfg_bool("direct_mode", false);
-			} else if (na == 1) {
-				push(actions, "узлы живы — проблема не в серверах");
+	if (!quick && cfg_bool("diag_repair", true) && !cooling) {
+		if (paused) {
+			// на паузе чиним только в сторону снятия (см. repair_paused)
+			if (repair_paused(actions, errors)) {
+				checks = run_checks(false, true);
+				bad = failed(checks);
 			}
 		}
+		else if (init_exists("podkop")) {
+			let direct = cfg_bool("direct_mode", false);
 
-		// 4. интернета всё ещё нет — спускаемся по DNS-лестнице до первой
-		//    рабочей ступени (DoH → DoT → UDP 77.88.8.8)
-		if (!internet_ok() && !direct) {
-			let lvl = dns_level_get();
-			let from = (lvl >= 0) ? lvl + 1 : 0;
-			let next = first_working_from(from);
-			if (next < 0 && from > 0)
-				next = first_working_from(0);
-			if (next >= 0)
-				set_dns_level(next, l, actions);
-			else
-				push(actions, "dns: ни одна ступень не отвечает — проблема не в DNS");
+			// 0. интернета нет, а мы в туннеле: возможно, панель уже выдала другие
+			//    узлы — подтягиваем подписку (не чаще раза в 30 минут). Update сам
+			//    перезапускает podkop, поэтому дальше даём туннелю подняться.
+			if (!internet_ok() && !direct && refresh_subscription(l, actions))
+				cooling = restart_recently(l);
+
+			// 1. автозапуск podkop снят — возвращаем (это и есть «интернет пропал
+			//    после ребута»), если не в direct-режиме
+			if (!cooling && !podkop_enabled() && !direct) {
+				quiet(PODKOP + " enable");
+				push(actions, "podkop: автозапуск включён");
+			}
+
+			// 2. сервис не поднят / nft нет — перезапускаем и ждём готовности
+			if (!cooling && (!podkopctl.singbox_running() || !podkopctl.tunnel_up()))
+				if (restart_podkop(l, actions, errors))
+					cooling = true;
+
+			if (cooling) {
+				push(actions, "podkop перезапущен: " + RESTART_COOLDOWN + " с не трогаем — туннель поднимается");
+			}
+			else {
+				// 3. все узлы мертвы — держать podkop включённым нельзя: он душит
+				//    интернет и ломает загрузку rule-set'ов podkop. Переводим всё
+				//    в direct, пока не появятся живые серверы.
+				if (!internet_ok() && !direct && (podkopctl.singbox_running() || podkopctl.tunnel_up())) {
+					system("sleep 3");
+					let na = nodes_alive();
+					if (na == 0) {
+						push(actions, "все узлы мертвы — перевожу всё в direct");
+						to_direct(l, actions);
+						direct = cfg_bool("direct_mode", false);
+					} else if (na == 1) {
+						push(actions, "узлы живы — проблема не в серверах");
+					}
+				}
+
+				// 4. интернета всё ещё нет — спускаемся по DNS-лестнице до первой
+				//    рабочей ступени (DoH → DoT → UDP 77.88.8.8)
+				if (!internet_ok() && !direct) {
+					let lvl = dns_level_get();
+					let from = (lvl >= 0) ? lvl + 1 : 0;
+					let next = first_working_from(from);
+					if (next < 0 && from > 0)
+						next = first_working_from(0);
+					if (next >= 0)
+						set_dns_level(next, l, actions);
+					else
+						push(actions, "dns: ни одна ступень не отвечает — проблема не в DNS");
+				}
+
+				// 5. последний рубеж — direct, чтобы LAN не остался без сети совсем
+				if (!internet_ok() && !direct)
+					to_direct(l, actions);
+
+				// 6. direct и узлы снова живы — возвращаемся в туннель
+				if (cfg_bool("direct_mode", false) && internet_ok() && opts.resume == true)
+					from_direct(l, actions);
+			}
+
+			checks = run_checks(false, false);
+			bad = failed(checks);
 		}
-
-		// 5. последний рубеж — direct, чтобы LAN не остался без сети совсем
-		if (!internet_ok() && !direct)
-			to_direct(l, actions);
-
-		// 6. direct и узлы снова живы — возвращаемся в туннель
-		if (cfg_bool("direct_mode", false) && internet_ok() && opts.resume == true)
-			from_direct(l, actions);
-
-		checks = run_checks(false, false);
-		bad = failed(checks);
 	}
 
 	let report = {

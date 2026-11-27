@@ -6,7 +6,8 @@ START=99
 # Логика лежит в самом shoulderkop (команда `schedule`), чтобы у LuCI и rc был
 # один и тот же путь записи в /etc/crontabs/root.
 #
-# Сами обновления: `shoulderkop update` → fetch → parse → apply → /etc/init.d/podkop reload.
+# Сами обновления: `shoulderkop update` → fetch → parse → apply → restart podkop
+# и ожидание готовности туннеля (podkopctl).
 
 start() {
 	/usr/bin/shoulderkop schedule >/dev/null 2>&1

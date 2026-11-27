@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=shoulderkop
-PKG_VERSION:=0.5.5
+PKG_VERSION:=0.6.0
 PKG_RELEASE:=1
 
 PKG_LICENSE:=MIT
@@ -20,8 +20,8 @@ endef
 define Package/shoulderkop/description
   Shoulderkop downloads an Xray-JSON subscription (Remnawave/Happ) or a list of
   vless:// links, converts nodes to sing-box outbounds and fills podkop sections
-  automatically. Two modes: "obhod BS" (whole LAN via proxy, RKN lists direct)
-  and "home internet" (YouTube + EU sections via proxy, everything else direct).
+  skop_yt and skop_eu automatically. Traffic of the configured community lists
+  goes through the tunnel, everything else goes directly.
 
   Needs podkop > 0.7.24 at runtime (not a build dependency: podkop is not in the
   official feeds). Nodes with the xhttp transport require

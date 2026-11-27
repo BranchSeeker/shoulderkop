@@ -1,47 +1,36 @@
-// apply.uc — раскладка узлов подписки по секциям podkop по выбранному режиму.
+// apply.uc — раскладка узлов подписки по секциям podkop. Режим один —
+// «Домашний интернет» (wifi):
+//   skop_yt — urltest, community_lists из wifi_yt_lists;
+//   skop_eu — urltest, community_lists из wifi_eu_lists;
+// обе секции — urltest_proxy_links со vless-ссылками, xhttp-узлы отсеиваются:
+// без `tools decode-link` podkop такие ссылки не разбирает.
 //
-// Режимы:
-//   lte  → skop_lte (proxy, все LTE-узлы группой, fully_routed_ips = LAN + 127.0.0.1)
-//          skop_lte_direct (exclusion, rkn-списки .srs → direct)
-//   wifi → skop_yt (urltest, community_lists из wifi_yt_lists; по умолчанию youtube)
-//          skop_eu (urltest, community_lists из wifi_eu_lists; по умолчанию
-//                   russia_inside,telegram,meta,cloudflare,hodca,roblox)
-//          Обе секции — urltest_proxy_links со vless-ссылками, никаких
-//          outbound-секций и балансировщиков. xhttp-узлы отсеиваются: без
-//          `tools decode-link` podkop такие ссылки не разбирает.
-//          Списки сообщества редактируются в LuCI; пока опций в конфиге нет,
-//          действуют захардкоженные значения по умолчанию.
+// Списки сообщества — настоящий редактор секций: что в конфиге, то и в podkop,
+// пусто — значит пусто. Дефолты один раз пишет migrate_settings (main.uc),
+// здесь подстановок нет.
 //
 // Сервера в секции:
-//   - 1 узел       → одиночный outbound_json (кроме WiFi: там всегда urltest);
 //   - ссылки podkop умеет декодировать сама (vless tcp/ws/grpc, либо любой
 //     транспорт при наличии tools decode-link)
 //                  → proxy_config_type=urltest + urltest_proxy_links;
-//   - иначе        → «синтетическая группа»: дочерние секции skop_<режим>_NN
+//   - иначе        → «синтетическая группа»: дочерние секции skop_<имя>_NN
 //                    (outbound) + urltest-JSON на их теги <child>-out.
-//     Оба варианта — urltest, никаких балансировщиков.
 //
 // Всё, что начинается с `skop_`, считаем своим и удаляем, если оно больше не нужно.
-// Секцию без подходящих серверов НЕ создаём: пустой proxy-секции podkop не переварит
-// («Outbound section not found») и упадёт целиком.
+// Секцию без подходящих серверов НЕ создаём: пустой proxy-секции podkop не
+// переварит («Outbound section not found») и упадёт целиком.
+//
+// podkop здесь не перезапускается: раскладка пишет конфиг, а перезапуск и
+// ожидание готовности делает main.uc через podkopctl.
 
 'use strict';
 
 let fs = require("fs");
 let uci = require("uci");
-let lists = require("lists");
+let podkopctl = require("podkopctl");
 
-const GEOSITE = "https://github.com/BranchSeeker/rkn-whitelist-srs/releases/latest/download/geosite.srs";
-const GEOIP = "https://github.com/BranchSeeker/rkn-whitelist-srs/releases/latest/download/geoip.srs";
+const MODE = "wifi";
 const PREFIX = "skop_";
-
-// Списки сообщества podkop для WiFi-секций. Пока в конфиге нет своих значений,
-// используются эти: поведение по умолчанию остаётся прежним (YouTube отдельно,
-// остальные сервисы через russia_inside).
-const WIFI_YT_LISTS_DEFAULT = [ "youtube" ];
-const WIFI_EU_LISTS_DEFAULT = [
-	"russia_inside", "telegram", "meta", "cloudflare", "hodca", "roblox"
-];
 
 // podkop падает целиком на неизвестном community list («Invalid service ... Aborted»),
 // поэтому чужие/опечатанные значения отбрасываем. Набор — как COMMUNITY_SERVICES
@@ -92,10 +81,16 @@ function urltest_interval() {
 	return URLTEST_DEFAULT;
 }
 
-// UCI-список (option ... / list ...) → массив значений
+// UCI-список (option ... / list ...) → массив значений. `uci get` отдаёт
+// list-опцию одной строкой, элементы разделены любым пробельным символом
+// (пробел, таб, перевод строки). Делим по всем сразу: иначе «a b» приходит
+// одним значением и не проходит фильтр COMMUNITY_LISTS.
 function uci_list_get(cfg, sec, opt) {
+	let raw = uci_get(cfg, sec, opt);
+	raw = replace(replace(raw, "\n", " "), "\t", " ");
+
 	let out = [];
-	for (let v in split(uci_get(cfg, sec, opt), "\n")) {
+	for (let v in split(raw, " ")) {
 		v = trim(v);
 		if (v != "")
 			push(out, v);
@@ -103,9 +98,10 @@ function uci_list_get(cfg, sec, opt) {
 	return out;
 }
 
-// community_lists для секции: значения из конфига, иначе — захардкоженный
-// набор по умолчанию. Неизвестные podkop имена отбрасываем (он на них падает).
-function community_lists(opt, defaults) {
+// community_lists для секции: ровно то, что в конфиге. Порядок сохраняем,
+// повторы и неизвестные podkop имена отбрасываем. Пустой список = пусто:
+// подстановок дефолтов здесь больше нет (их один раз пишет migrate_settings).
+function community_lists(opt) {
 	let allowed = {};
 	for (let v in COMMUNITY_LISTS)
 		allowed[v] = true;
@@ -118,15 +114,7 @@ function community_lists(opt, defaults) {
 			push(out, v);
 		}
 	}
-
-	return (length(out) > 0) ? out : defaults;
-}
-
-function wifi_lists() {
-	return {
-		yt: community_lists("wifi_yt_lists", WIFI_YT_LISTS_DEFAULT),
-		eu: community_lists("wifi_eu_lists", WIFI_EU_LISTS_DEFAULT)
-	};
+	return out;
 }
 
 function has(hay, needle) {
@@ -163,10 +151,6 @@ function same_list(a, b) {
 	return true;
 }
 
-function node_server(n) {
-	return (n.outbound == null) ? "" : ("" + (n.outbound.server || ""));
-}
-
 function transport_of(n) {
 	if (n.outbound == null)
 		return "tcp";
@@ -174,9 +158,9 @@ function transport_of(n) {
 	return (type(tr) == "object") ? ("" + (tr.type || "tcp")) : "tcp";
 }
 
-// xhttp podkop без `tools decode-link` не разбирает. В WiFi-секциях такие узлы
+// xhttp podkop без `tools decode-link` не разбирает. В wifi-секциях такие узлы
 // отбрасываем жёстко: иначе urltest_proxy_links не собрать и секция уедет в
-// синтетическую группу из outbound-секций. LTE этим не трогаем.
+// синтетическую группу из outbound-секций.
 function is_xhttp_node(n) {
 	let t = lc(transport_of(n));
 	return t == "xhttp" || t == "splithttp";
@@ -359,22 +343,6 @@ function want(p, cur, sec, opt, value) {
 	return 1;
 }
 
-// скалярная опция в podkop.settings (snapshot() хранит только section, не
-// settings, поэтому для настроек читаем значение напрямую)
-function want_settings(p, opt, value) {
-	let have = p.get("podkop", "settings", opt);
-	if (value == null || value == "") {
-		if (have == null || have == "")
-			return 0;
-		p.delete("podkop", "settings", opt);
-		return 1;
-	}
-	if (have != null && "" + have == "" + value)
-		return 0;
-	p.set("podkop", "settings", opt, "" + value);
-	return 1;
-}
-
 // свои дочерние секции группы: <name>_NN
 function own_children(cur, name) {
 	let out = [];
@@ -399,18 +367,14 @@ function own_children(cur, name) {
 	return out;
 }
 
-// --- режимы ----------------------------------------------------------------
+// --- отбор серверов --------------------------------------------------------
 
 // Подписка Remnawave отдаёт по одному клиентскому конфигу на «хост», и именно
-// remarks этого конфига содержит метку («🇪🇺📱LTE ❯ Обход Белых списков»,
-// «🇷🇺 WiFi ❯ Россия (YouTube)»). У самих узлов в name — только их tag, поэтому
-// режимы отбирают серверы по группе, а name/адрес оставляем как запасной путь.
+// remarks этого конфига содержит метку («🇷🇺 WiFi ❯ Россия (YouTube)»).
+// У самих узлов в name — только их tag, поэтому режимы отбирают серверы по
+// группе, а name/адрес оставляем как запасной путь.
 function group_of(n) {
 	return "" + (n.group || "");
-}
-
-function is_lte(n) {
-	return has(group_of(n), "lte") || has(n.name, "lte") || has(node_server(n), "lte");
 }
 
 function is_wifi(n) {
@@ -426,66 +390,37 @@ function is_yt(n) {
 	return has_any(s, [ "youtube", "YouTube", "Россия", "россия", "РОССИЯ" ]);
 }
 
-function plan(mode) {
-	let out = [];
-
-	if (mode == "wifi") {
-		let lists = wifi_lists();
-		// Обе WiFi-секции — urltest: podkop сам выбирает лучший сервер по задержке.
-		// xhttp отбрасываем жёстко: без decode-link podkop не умеет такие ссылки,
-		// и секция вместо urltest_proxy_links уехала бы в outbound-группу.
-		push(out, {
+// План wifi-раскладки. Обе секции — urltest: podkop сам выбирает лучший сервер
+// по задержке. skop_eu — основная: если в подписке нет меток WiFi/Youtube,
+// все серверы уходят в неё (иначе настройка осталась бы пустой).
+function plan() {
+	return [
+		{
 			name: "skop_yt",
-			kind: "proxy",
-			urltest: true,
-			community: lists.yt,
+			community: community_lists("wifi_yt_lists"),
 			select: function (n) {
 				return is_wifi(n) && !is_xhttp_node(n);
 			}
-		});
-		push(out, {
+		},
+		{
 			name: "skop_eu",
-			kind: "proxy",
-			urltest: true,
 			primary: true,
-			community: lists.eu,
+			community: community_lists("wifi_eu_lists"),
 			select: function (n) {
 				return is_wifi(n) && !is_yt(n) && !is_xhttp_node(n);
 			}
-		});
-		return out;
-	}
-
-	// lte (по умолчанию)
-	push(out, {
-		name: "skop_lte",
-		kind: "proxy",
-		primary: true,
-		fully_routed: true,
-		select: function (n) {
-			return is_lte(n);
 		}
-	});
-	push(out, {
-		name: "skop_lte_direct",
-		kind: "exclusion",
-		remote_domain: [ GEOSITE ],
-		remote_subnet: [ GEOIP ]
-	});
-	return out;
+	];
 }
 
-// какие узлы попадут в proxy-секции режима — для `shoulderkop links`.
-// Повторяет отбор apply(): если в подписке нет меток LTE/WiFi, все узлы идут
-// в основную секцию режима.
-function plan_sections(mode, nodes) {
-	if (mode != "wifi")
-		mode = "lte";
-
-	let list = plan(mode);
+// какие узлы попадут в proxy-секции — для `shoulderkop links`.
+// Повторяет отбор apply(): если в подписке нет меток WiFi, все узлы идут
+// в основную секцию.
+function plan_sections(nodes) {
+	let list = plan();
 	let any_hit = false;
 	for (let d in list)
-		if (d.kind == "proxy" && d.select != null)
+		if (d.select != null)
 			for (let n in nodes)
 				if (d.select(n)) {
 					any_hit = true;
@@ -494,9 +429,6 @@ function plan_sections(mode, nodes) {
 
 	let out = [];
 	for (let d in list) {
-		if (d.kind != "proxy")
-			continue;
-
 		let matched = [];
 		if (d.select != null)
 			for (let n in nodes)
@@ -514,12 +446,12 @@ function plan_sections(mode, nodes) {
 
 // --- запись серверов в секцию ---------------------------------------------
 
-// вернуть { mode, node?, count, children[], xhttp?, changed }
+// вернуть { mode, node?, count, children[], changed }
 function write_servers(p, cur, name, nodes, decode_ok, urltest_iv, force_urltest) {
 	let n = length(nodes);
 	let changed = 0;
 
-	// Один узел обычно кладём одиночным outbound. Но WiFi-секции должны быть
+	// Один узел обычно кладём одиночным outbound. Но wifi-секции должны быть
 	// именно urltest-секциями, поэтому для них force_urltest=true и даже один
 	// сервер уходит в urltest_proxy_links (группа из одной ссылки).
 	if (n == 1 && !force_urltest) {
@@ -532,7 +464,7 @@ function write_servers(p, cur, name, nodes, decode_ok, urltest_iv, force_urltest
 	if (native_links_ok(nodes, decode_ok)) {
 		let links = [];
 		for (let node in nodes) {
-			// xhttp в WiFi-секции отсеивается ещё в plan(); здесь страховка,
+			// xhttp в wifi-секции отсеивается ещё в plan(); здесь страховка,
 			// чтобы в urltest_proxy_links не попала ссылка, которую podkop
 			// без tools.decode-link не разберёт.
 			if (is_xhttp_node(node))
@@ -593,6 +525,18 @@ function cleanup(p, cur, keep) {
 		push(removed, name);
 	}
 	return removed;
+}
+
+// снести все свои секции — для `update --rebuild`, когда план уже проверен
+function wipe_own(p, cur) {
+	let gone = [];
+	for (let name in cur) {
+		if (substr(name, 0, length(PREFIX)) != PREFIX)
+			continue;
+		p.delete("podkop", name);
+		push(gone, name);
+	}
+	return gone;
 }
 
 // --- настройки podkop ------------------------------------------------------
@@ -659,36 +603,29 @@ function is_pristine_main(cur) {
 	return true;
 }
 
-function podkop_state() {
-	return {
-		enabled: trim(sh("ls /etc/rc.d/[SK]*podkop 2>/dev/null")) != "",
-		// [s]ing-box — иначе pgrep находит `sh -c` с этим же шаблоном в cmdline
-		running: trim(sh("pgrep -f '[s]ing-box[^ ]* run' 2>/dev/null")) != ""
-	};
-}
-
 // --- точка входа -----------------------------------------------------------
 
-// nodes — массив узлов из subscription.uc
-function apply(nodes) {
-	let mode = trim(uci_get("shoulderkop", "settings", "mode"));
-	if (mode != "wifi")
-		mode = "lte";
+// nodes — массив узлов из subscription.uc; opts.rebuild — пересобрать секции
+// с нуля (снос только после проверки, что новый план не пустой).
+function apply(nodes, opts) {
+	opts = opts || {};
+	let rebuild = (opts.rebuild == true);
 
 	let decode_ok = engine_decode_link();
 	let urltest_iv = urltest_interval();
-	let plan_list = plan(mode);
+	let plan_list = plan();
 
 	let p = uci.cursor();
 
 	// чистый роутер: podkop может быть не установлен — не создаём ему конфиг и не падаем
 	if (!p.load("podkop") || p.get("podkop", "settings") == null)
 		return {
-			mode: mode,
+			mode: MODE,
 			lan: null,
 			engine_decode_link: decode_ok,
 			changed: false,
-			service: podkop_state(),
+			service: podkopctl.state(),
+			rebuilt: false,
 			report: [],
 			removed: [],
 			error: "podkop не установлен: в /etc/config/podkop нет секции settings — секции раскладывать некуда"
@@ -705,36 +642,63 @@ function apply(nodes) {
 
 	let cur = snapshot(p);
 
+	// Сначала считаем план, ничего не записывая: при --rebuild нельзя сносить
+	// секции, если подходящих серверов нет — иначе podkop останется без outbound.
+	let any_hit = false;
+	for (let d in plan_list)
+		for (let n in nodes)
+			if (d.select(n)) {
+				any_hit = true;
+				break;
+			}
+
+	let prepared = [];
+	let total = 0;
+	for (let d in plan_list) {
+		let matched = [];
+		for (let n in nodes)
+			if (d.select(n))
+				push(matched, n);
+
+		// в подписке-списке ссылок нет меток WiFi: тогда все серверы идут
+		// в основную секцию, иначе настройка осталась бы пустой
+		if (length(matched) == 0 && d.primary && !any_hit)
+			matched = nodes;
+
+		push(prepared, { desc: d, nodes: matched });
+		total += length(matched);
+	}
+
+	let rebuilt = false;
+	let removed = [];
+
+	if (rebuild) {
+		if (total == 0)
+			return {
+				mode: MODE,
+				lan: null,
+				engine_decode_link: decode_ok,
+				changed: false,
+				service: podkopctl.state(),
+				rebuilt: false,
+				report: [],
+				removed: [],
+				error: "пересборка отменена: подходящих серверов нет — секции podkop не тронуты"
+			};
+		removed = wipe_own(p, cur);
+		cur = snapshot(p);
+		rebuilt = true;
+	}
+
 	let report = [];
 	let keep = {};
 	let changed = auto_changed;
-	let cidr = null;
-	let local_http = false;
-	let any_hit = false;
-	if (length(nodes) > 0)
-		for (let d in plan_list)
-			if (d.select != null)
-				for (let n in nodes)
-					if (d.select(n)) {
-						any_hit = true;
-						break;
-					}
 
-	for (let desc in plan_list) {
-		let matched = [];
-		if (desc.select != null)
-			for (let n in nodes)
-				if (desc.select(n))
-					push(matched, n);
+	for (let it in prepared) {
+		let desc = it.desc;
+		let matched = it.nodes;
 
-		// в подписке-списке ссылок нет меток LTE/WiFi: тогда все серверы идут
-		// в основную секцию режима, иначе настройка осталась бы пустой
-		if (desc.kind == "proxy" && length(matched) == 0 && desc.primary && !any_hit) {
-			matched = nodes;
-			push(report, { warn: "no mode labels in subscription, all servers put into " + desc.name });
-		}
-
-		if (desc.kind == "proxy" && length(matched) == 0) {
+		if (length(matched) == 0) {
 			if (cur[desc.name] == null) {
 				push(report, { section: desc.name, count: 0,
 					error: "no matched nodes, section not created" });
@@ -754,81 +718,10 @@ function apply(nodes) {
 			continue;
 		}
 		keep[sec] = true;
-		changed += want(p, cur, sec, "connection_type", desc.kind);
-
-		if (desc.kind == "exclusion") {
-			// Локальный кэш списков, если он уже скачан: podkop не ходит на
-			// GitHub при каждом reload. Нет файлов — прежние remote-ссылки.
-			let lf = lists.local_files();
-			let hu = lists.http_urls();
-			let local_domain = [];
-			let local_subnet = [];
-			let remote_domain = [];
-			let remote_subnet = [];
-			let dom_kind = "remote";
-			let sub_kind = "remote";
-
-			// 1) локальный HTTP (.srs через uhttpd) — быстро, без разбора;
-			// 2) локальный plain-файл — работает без uhttpd, но медленно;
-			// 3) remote GitHub — как раньше.
-			if (hu != null && hu.domain != null) {
-				remote_domain = [ hu.domain ];
-				dom_kind = "http";
-			}
-			else if (lf.domain != null) {
-				local_domain = [ lf.domain ];
-				dom_kind = "local";
-			}
-			else {
-				remote_domain = desc.remote_domain || [];
-			}
-
-			if (hu != null && hu.subnet != null) {
-				remote_subnet = [ hu.subnet ];
-				sub_kind = "http";
-			}
-			else if (lf.subnet != null) {
-				local_subnet = [ lf.subnet ];
-				sub_kind = "local";
-			}
-			else {
-				remote_subnet = desc.remote_subnet || [];
-			}
-			if (dom_kind == "http" || sub_kind == "http")
-				local_http = true;
-			changed += want(p, cur, sec, "local_domain_lists", local_domain);
-			changed += want(p, cur, sec, "local_subnet_lists", local_subnet);
-			changed += want(p, cur, sec, "remote_domain_lists", remote_domain);
-			changed += want(p, cur, sec, "remote_subnet_lists", remote_subnet);
-			push(report, {
-				section: sec,
-				kind: "exclusion",
-				lists: length(local_domain) + length(local_subnet) +
-					length(remote_domain) + length(remote_subnet),
-				source: (dom_kind == "http" || sub_kind == "http") ? "http" :
-					((dom_kind == "local" || sub_kind == "local") ? "local" : "remote"),
-				domains: lf.domain_count,
-				subnets: lf.subnet_count
-			});
-			continue;
-		}
-
+		changed += want(p, cur, sec, "connection_type", "proxy");
 		changed += want(p, cur, sec, "community_lists", desc.community || []);
-		changed += want(p, cur, sec, "remote_domain_lists", desc.remote_domain || []);
-		changed += want(p, cur, sec, "remote_subnet_lists", desc.remote_subnet || []);
 
-		if (desc.fully_routed) {
-			if (cidr == null)
-				cidr = lan_cidr();
-			if (cidr != null)
-				changed += want(p, cur, sec, "fully_routed_ips", [ cidr, "127.0.0.1" ]);
-			else
-				push(report, { section: sec, warn: "lan subnet not detected" });
-		}
-		else
-			changed += want(p, cur, sec, "fully_routed_ips", []);
-
-		let r = write_servers(p, cur, sec, matched, decode_ok, urltest_iv, desc.urltest == true);
+		let r = write_servers(p, cur, sec, matched, decode_ok, urltest_iv, true);
 		changed += r.changed;
 		for (let c in (r.children || []))
 			keep[c] = true;
@@ -837,30 +730,11 @@ function apply(nodes) {
 		push(report, r);
 	}
 
-	// LTE: podkop сам скачивает white-list .srs при reload. В LTE GitHub
-	// напрямую недоступен, поэтому просим podkop качать списки через туннель
-	// (mixed inbound 127.0.0.1:4534 на секцию skop_lte). Тем же входом
-	// пользуется lists.uc, когда кэширует списки локально.
-	let lte_nodes = 0;
-	for (let r in report)
-		if (r.section == "skop_lte" && r.kind == "proxy")
-			lte_nodes = int("" + (r.count || 0));
-	if (mode == "lte" && lte_nodes > 0 && !local_http) {
-		changed += want_settings(p, "download_lists_via_proxy", "1");
-		changed += want_settings(p, "download_lists_via_proxy_section", "skop_lte");
-	}
-	else {
-		// WiFi или LTE без серверов. Свой mixed proxy на skop_lte убираем:
-		// иначе podkop останется с настройкой на несуществующую секцию.
-		// Чужую настройку пользователя (другая секция) не трогаем.
-		let cur_sec = "" + (p.get("podkop", "settings", "download_lists_via_proxy_section") || "");
-		if (mode == "lte" || cur_sec == "skop_lte") {
-			changed += want_settings(p, "download_lists_via_proxy", "0");
-			changed += want_settings(p, "download_lists_via_proxy_section", null);
-		}
-	}
-
-	let removed = cleanup(p, cur, keep);
+	// всё, что начинается с skop_ и не нужно текущей wifi-раскладке, — наше:
+	// сюда же попадают lte-секции прежних версий
+	let gone = cleanup(p, cur, keep);
+	for (let name in gone)
+		push(removed, name);
 
 	// без своих секций main трогать не будем — иначе оставим podkop без прокси
 	if (length(keys(keep)) > 0 && is_pristine_main(cur)) {
@@ -874,11 +748,12 @@ function apply(nodes) {
 		push(report, { warn: auto_error });
 
 	return {
-		mode: mode,
-		lan: cidr,
+		mode: MODE,
+		lan: null,
 		engine_decode_link: decode_ok,
 		changed: changed > 0,
-		service: podkop_state(),
+		service: podkopctl.state(),
+		rebuilt: rebuilt,
 		report: report,
 		removed: removed
 	};

@@ -17,11 +17,11 @@ let uci = require("uci");
 let subscription = require("subscription");
 let convert = require("convert");
 let fetchmod = require("fetch");
-let listsmod = require("lists");
 let applymod = require("apply");
 let lifecycle = require("lifecycle");
 let diagmod = require("diag");
 let selfupd = require("selfupdate");
+let podkopctl = require("podkopctl");
 
 const CACHE = "/tmp/shoulderkop.cache.json";
 const STATE = "/tmp/shoulderkop.state.json";
@@ -55,6 +55,10 @@ function sh(cmd) {
 	let out = fs.readfile(tmp);
 	fs.unlink(tmp);
 	return (out == null) ? "" : out;
+}
+
+function quiet(cmd) {
+	system(cmd + " >/dev/null 2>&1");
 }
 
 // Умеет ли движок xhttp. Обычный sing-box — нет: такие узлы надо выкинуть из
@@ -131,6 +135,26 @@ function hwid_from_mac() {
 	return "";
 }
 
+// Остатки LTE (0.5.x): каталог кэша белых списков, его копия в /www и наша
+// настройка podkop «качать списки через прокси». Вызывается один раз —
+// migrate_settings по флагу lists_seeded.
+function drop_lte_leftovers() {
+	quiet("rm -rf /etc/shoulderkop/lists /www/shoulderkop-lists");
+
+	let p = uci.cursor();
+	if (!p.load("podkop"))
+		return;
+	let dirty = false;
+	for (let opt in [ "download_lists_via_proxy", "download_lists_via_proxy_section" ]) {
+		if (p.get("podkop", "settings", opt) != null) {
+			p.delete("podkop", "settings", opt);
+			dirty = true;
+		}
+	}
+	if (dirty)
+		p.commit("podkop");
+}
+
 // Старая схема v1 (`config shoulder`) больше не используется: убираем её один раз,
 // чтобы не было двух источников правды, и выставляем значения по умолчанию.
 function migrate_settings() {
@@ -146,10 +170,27 @@ function migrate_settings() {
 
 	let changed = length(old) > 0;
 
-	if (c.get("shoulderkop", "settings", "mode") == null) {
-		c.set("shoulderkop", "settings", "mode", "wifi");
+	// Режим один — «Домашний интернет» (wifi): поля mode в конфиге больше нет,
+	// а у обновившихся с LTE оно снимается.
+	if (c.get("shoulderkop", "settings", "mode") != null) {
+		c.delete("shoulderkop", "settings", "mode");
 		changed = true;
 	}
+
+	// Миграция 0.6.0 ровно один раз (флаг lists_seeded): остатки LTE и дефолты
+	// списков сообщества. Флаг, а не «опций нет», потому что пустой список в
+	// конфиге — выбор пользователя, и roblox туда возвращаться не должен.
+	if ("" + (c.get("shoulderkop", "settings", "lists_seeded") || "") != "1") {
+		drop_lte_leftovers();
+		if (c.get("shoulderkop", "settings", "wifi_yt_lists") == null)
+			c.set("shoulderkop", "settings", "wifi_yt_lists", "youtube");
+		if (c.get("shoulderkop", "settings", "wifi_eu_lists") == null)
+			c.set("shoulderkop", "settings", "wifi_eu_lists",
+				[ "russia_inside", "telegram", "meta", "cloudflare", "hodca", "roblox" ]);
+		c.set("shoulderkop", "settings", "lists_seeded", "1");
+		changed = true;
+	}
+
 	if (c.get("shoulderkop", "settings", "urltest_interval") == null) {
 		c.set("shoulderkop", "settings", "urltest_interval", "30s");
 		changed = true;
@@ -458,61 +499,89 @@ function fetch_nodes() {
 	};
 }
 
-function reload_podkop() {
-	// на чистом роутере podkop может отсутствовать — просто нечего перезагружать
-	if (fs.stat("/etc/init.d/podkop") == null)
-		return;
-	system("/etc/init.d/podkop reload >/dev/null 2>&1");
-}
-
 function write_state(result) {
 	fs.writefile(STATE, sprintf("%J", result));
 }
 
-// применить узлы и вернуть отчёт; opts.no_reload — не дёргать podkop,
-// пока он на паузе (после resume его старт сам прочитает новый конфиг)
+// лок на путь «запись конфига podkop → restart → ожидание»: берётся в
+// cmd_update/cmd_apply и снимается здесь же, на любом выходе
+let lock_held = false;
+
+function finish(result, code) {
+	if (lock_held) {
+		podkopctl.lock_release();
+		lock_held = false;
+	}
+	write_state(result);
+	print(sprintf("%J", result));
+	return code;
+}
+
+// отчёт, когда применить настройки не дали: другой запуск уже держит лок
+function busy_report() {
+	return {
+		updated: time(),
+		status: "busy",
+		count: 0,
+		mode: "wifi",
+		lan: null,
+		engine_decode_link: null,
+		service: lifecycle.service_state(),
+		reloaded: false,
+		applied: [],
+		removed: [],
+		errors: [ "другой запуск shoulderkop уже применяет настройки — повторите позже" ],
+		warnings: [],
+		userinfo: null,
+		checked: [],
+		suspended: lifecycle.is_suspended(),
+		suspended_at: lifecycle.suspended_info().at,
+		restart_attempts: 0
+	};
+}
+
+// применить узлы и вернуть отчёт; podkop здесь не перезапускается — это делает
+// tunnel_restart() после раскладки, под тем же локом
 function apply_nodes(nodes, errors, warnings, opts) {
 	opts = opts || {};
 	let applied = null;
 	if (length(nodes) > 0) {
-		applied = applymod.apply(nodes);
+		applied = applymod.apply(nodes, { rebuild: opts.rebuild == true });
 		if (applied.error != null)
 			push(errors, applied.error);
-		if (applied.changed && !opts.no_reload)
-			reload_podkop();
 	}
 
 	return {
 		count: length(nodes),
-		mode: (applied != null) ? applied.mode : uci_get("shoulderkop", "settings", "mode"),
+		mode: "wifi",
 		lan: (applied != null) ? applied.lan : null,
 		engine_decode_link: (applied != null) ? applied.engine_decode_link : null,
 		// единый источник состояния: он же знает про паузу подписки
 		service: lifecycle.service_state(),
-		reloaded: (applied != null && applied.changed && !opts.no_reload) ? true : false,
+		reloaded: false,
 		applied: (applied != null) ? applied.report : [],
 		removed: (applied != null) ? applied.removed : [],
+		rebuilt: (applied != null) ? (applied.rebuilt == true) : false,
 		errors: errors,
 		warnings: warnings
 	};
 }
 
-// full rebuild: drop all skop_* sections, apply recreates them from scratch
-function wipe_sections() {
-	let c = uci.cursor();
-	c.load("podkop");
+// Перезапуск podkop после раскладки: restart (не reload) и ожидание готовности.
+// Не стартуем podkop, который пользователь держит выключенным; на паузе
+// вызывающий сам решает не поднимать туннель.
+function tunnel_restart(result) {
+	let st = podkopctl.state();
+	if (!st.installed || (!st.enabled && !st.tunnel_up && !st.running))
+		return result;
 
-	let names = [];
-	c.foreach("podkop", "section", function (s) {
-		if (substr(s[".name"], 0, 5) == "skop_")
-			push(names, s[".name"]);
-	});
-	for (let n in names)
-		c.delete("podkop", n);
-	if (length(names) > 0)
-		c.commit("podkop");
-
-	return length(names);
+	let rs = podkopctl.restart_and_wait();
+	result.reloaded = (rs.attempts > 0);
+	result.restart_attempts = rs.attempts;
+	result.tunnel_up = rs.tunnel_up;
+	for (let e in rs.errors)
+		push(result.errors, e);
+	return result;
 }
 
 // ---- настройки из командной строки ---------------------------------------
@@ -542,8 +611,6 @@ function parse_args(argv) {
 			a.rebuild = true;
 		else if (substr(v, 0, 6) == "--url=")
 			push(a.urls, substr(v, 6));
-		else if (substr(v, 0, 7) == "--mode=")
-			a.mode = substr(v, 7);
 		else if (substr(v, 0, 11) == "--interval=")
 			a.interval = substr(v, 11);
 		else if (substr(v, 0, 11) == "--urltest=")
@@ -582,7 +649,7 @@ function save_settings(a) {
 		dirty++;
 	}
 
-	// UCI-список: пустой массив = опции нет (apply тогда берёт значения по умолчанию)
+	// UCI-список: пустой массив = опции нет, а значит и списка в podkop нет
 	function put_list(opt, val) {
 		if (val == null)
 			return;
@@ -617,7 +684,6 @@ function save_settings(a) {
 	}
 	if (length(http_urls) > 0)
 		put("subscription_url", http_urls);
-	put("mode", a.mode);
 	put("update_interval", a.interval);
 	put("urltest_interval", a.urltest);
 	put("enable_schedule", a.schedule);
@@ -632,24 +698,21 @@ function save_settings(a) {
 }
 
 function cmd_update(a) {
+	// «Запись конфига podkop → restart → ожидание» идёт под файловым локом:
+	// параллельный apply из LuCI или cron не должны перезапускать podkop
+	// одновременно и видеть чужой restart как «туннель лёг».
+	if (!podkopctl.lock_acquire()) {
+		print(sprintf("%J", busy_report()));
+		return 0;
+	}
+	lock_held = true;
+
 	migrate_settings();
 	save_settings(a);
 
 	let fetched = fetch_nodes();
 	let nodes = fetched.nodes;
 	let suspended = lifecycle.is_suspended();
-
-	// Белые списки РКН для LTE: скачиваем, пока подписка активна и сеть есть.
-	// Если GitHub недоступен, ничего не ломаем — apply возьмёт старый кэш или
-	// прежние remote-ссылки.
-	let lists_result = null;
-	let lists_warn = "";
-	if (fetched.status == "active") {
-		lists_result = listsmod.sync(false);
-		if (!lists_result.ok && !lists_result.skipped)
-			lists_warn = "белые списки не обновлены: " +
-				join("; ", lists_result.errors || []);
-	}
 
 	// Сначала узнаём статус подписки — и только потом трогаем секции.
 	// При истёкшей/недоступной подписке старая раскладка остаётся на месте.
@@ -664,10 +727,6 @@ function cmd_update(a) {
 	let shrink = (fetched.status == "active" && prev_subs > 0 &&
 		fetched.active < prev_subs && fetched.failed == 0);
 
-	let wiped = 0;
-	if (fetched.status == "active" && (a.rebuild || shrink))
-		wiped = wipe_sections();
-
 	fs.writefile(CACHE, sprintf("%J", {
 		updated: time(),
 		status: fetched.status,
@@ -678,18 +737,13 @@ function cmd_update(a) {
 		checked: fetched.checked
 	}));
 
-	// предупреждение только в отчёте этого запуска: в кэш его не кладём, иначе
-	// оно всплывёт в следующем «apply» без причины
-	if (shrink && !a.rebuild && wiped > 0)
-		push(fetched.warnings, "подписок стало меньше: секции Podkop пересобраны, серверы исчезнувшей подписки удалены");
-
 	if (fetched.status == "expired") {
 		let sus = lifecycle.suspend();
 		let result = {
 			updated: time(),
 			status: "expired",
 			count: 0,
-			mode: uci_get("shoulderkop", "settings", "mode"),
+			mode: "wifi",
 			lan: null,
 			engine_decode_link: null,
 			service: lifecycle.service_state(),
@@ -702,15 +756,15 @@ function cmd_update(a) {
 			checked: fetched.checked,
 			suspended: true,
 			suspended_at: sus.at,
-			actions: sus.actions
+			actions: sus.actions,
+			restart_attempts: 0,
+			paused_clean: sus.paused_clean == true
 		};
 		for (let e in sus.errors)
 			push(result.errors, e);
 		if (uci_get("shoulderkop", "settings", "enable_schedule") != "1")
 			push(result.warnings, "расписание выключено: проверить активацию подписки автоматически не получится");
-		write_state(result);
-		print(sprintf("%J", result));
-		return 0;
+		return finish(result, 0);
 	}
 
 	if (fetched.status != "active") {
@@ -720,7 +774,7 @@ function cmd_update(a) {
 			updated: time(),
 			status: "error",
 			count: 0,
-			mode: uci_get("shoulderkop", "settings", "mode"),
+			mode: "wifi",
 			lan: null,
 			engine_decode_link: null,
 			service: lifecycle.service_state(),
@@ -732,44 +786,27 @@ function cmd_update(a) {
 			userinfo: fetched.userinfo,
 			checked: fetched.checked,
 			suspended: suspended,
-			suspended_at: info.at
+			suspended_at: info.at,
+			restart_attempts: 0
 		};
-		write_state(result);
-		print(sprintf("%J", result));
-		return 1;
+		return finish(result, 1);
 	}
 
-	let result = apply_nodes(nodes, fetched.errors, fetched.warnings, { no_reload: suspended });
+	// раскладка: rebuild = «Пересобрать секции» или подписок стало меньше
+	let result = apply_nodes(nodes, fetched.errors, fetched.warnings,
+		{ rebuild: (a.rebuild || shrink) });
 	result.updated = time();
 	result.status = "active";
 	result.userinfo = fetched.userinfo;
 	result.checked = fetched.checked;
 	result.suspended = false;
 	result.resumed = false;
-	result.rebuilt = (shrink && wiped > 0);
+	result.restart_attempts = 0;
 
-	// Первый запуск в LTE: apply только что включил mixed proxy podkop.
-	// Пробуем ещё раз скачать списки уже через туннель и, если получилось,
-	// перекладываем секцию на локальные файлы (reload с локальными — быстрый).
-	if (lists_result != null && !lists_result.ok && !suspended &&
-	    uci_get("shoulderkop", "settings", "mode") == "lte") {
-		let lr2 = listsmod.sync(true);
-		if (lr2.ok) {
-			let r2 = apply_nodes(nodes, fetched.errors, fetched.warnings, { no_reload: suspended });
-			result = r2;
-			result.updated = time();
-			result.status = "active";
-			result.userinfo = fetched.userinfo;
-			result.checked = fetched.checked;
-			result.suspended = false;
-			result.resumed = false;
-			result.rebuilt = (shrink && wiped > 0);
-			lists_result = lr2;
-		}
-	}
-	result.lists = lists_result;
-	if (lists_warn != "" && (lists_result == null || !lists_result.ok))
-		push(result.warnings, lists_warn);
+	// предупреждение только в отчёте этого запуска: в кэш его не кладём, иначе
+	// оно всплывёт в следующем «apply» без причины
+	if (shrink && !a.rebuild && result.rebuilt)
+		push(result.warnings, "подписок стало меньше: секции Podkop пересобраны, серверы исчезнувшей подписки удалены");
 
 	// запоминаем число активных подписок для следующего сравнения; при ошибке
 	// сети значение не трогаем, чтобы истёкшую ссылку не спутать с недоступной
@@ -777,6 +814,7 @@ function cmd_update(a) {
 		uci_set("shoulderkop", "settings", "last_active_subs", "" + fetched.active);
 
 	if (suspended) {
+		// подписка снова активна — resume() сам вернёт автозапуск и поднимет podkop
 		let r = lifecycle.resume();
 		result.resumed = r.resumed;
 		result.resume_actions = r.actions;
@@ -784,6 +822,10 @@ function cmd_update(a) {
 			push(result.errors, e);
 		result.suspended = r.suspended;
 		result.service = lifecycle.service_state();
+		result.tunnel_up = podkopctl.tunnel_up();
+	} else {
+		// сразу после раскладки: restart (не reload) и ожидание готовности
+		tunnel_restart(result);
 	}
 
 	// узлы снова появились — если сидели в direct, возвращаемся в туннель
@@ -794,13 +836,17 @@ function cmd_update(a) {
 			push(result.warnings, a);
 	}
 
-	write_state(result);
-	print(sprintf("%J", result));
-	return 0;
+	return finish(result, 0);
 }
 
 // применить без повторного скачивания (кнопка «Сохранить и применить» в LuCI)
 function cmd_apply(a) {
+	if (!podkopctl.lock_acquire()) {
+		print(sprintf("%J", busy_report()));
+		return 0;
+	}
+	lock_held = true;
+
 	migrate_settings();
 	save_settings(a);
 
@@ -818,7 +864,7 @@ function cmd_apply(a) {
 			updated: time(),
 			status: expired ? "expired" : "error",
 			count: 0,
-			mode: uci_get("shoulderkop", "settings", "mode"),
+			mode: "wifi",
 			lan: null,
 			engine_decode_link: null,
 			service: lifecycle.service_state(),
@@ -830,33 +876,31 @@ function cmd_apply(a) {
 			userinfo: (cache == null) ? null : cache.userinfo,
 			checked: (cache == null) ? [] : (cache.checked || []),
 			suspended: suspended,
-			suspended_at: lifecycle.suspended_info().at
+			suspended_at: lifecycle.suspended_info().at,
+			restart_attempts: 0
 		};
 		if (expired) {
 			let sus = lifecycle.suspend();
 			result.suspended = true;
 			result.suspended_at = sus.at;
 			result.actions = sus.actions;
+			result.paused_clean = sus.paused_clean == true;
 			for (let e in sus.errors)
 				push(result.errors, e);
 			push(result.warnings, "подписка неактивна: узлов нет, туннель остаётся на паузе");
 		}
-		write_state(result);
-		print(sprintf("%J", result));
-		return expired ? 0 : 1;
+		return finish(result, expired ? 0 : 1);
 	}
 
-	if (a.rebuild)
-		wipe_sections();
-
 	let result = apply_nodes(nodes,
-		(cache.errors || []), (cache.warnings || []), { no_reload: suspended });
+		(cache.errors || []), (cache.warnings || []), { rebuild: a.rebuild });
 	result.updated = time();
 	result.status = "active";
 	result.userinfo = (cache == null) ? null : cache.userinfo;
 	result.checked = (cache == null) ? [] : (cache.checked || []);
 	result.suspended = false;
 	result.resumed = false;
+	result.restart_attempts = 0;
 
 	if (suspended) {
 		let r = lifecycle.resume();
@@ -866,11 +910,12 @@ function cmd_apply(a) {
 			push(result.errors, e);
 		result.suspended = r.suspended;
 		result.service = lifecycle.service_state();
+		result.tunnel_up = podkopctl.tunnel_up();
+	} else {
+		tunnel_restart(result);
 	}
 
-	write_state(result);
-	print(sprintf("%J", result));
-	return 0;
+	return finish(result, 0);
 }
 
 // Кэша нет (свежая установка, ребут) — не заставляем пользователя сначала жать
@@ -911,9 +956,9 @@ function cmd_list_servers() {
 // URL) либо outbound_json уже разложенных секций podkop и печатаем vless-ссылки.
 // Это то, что podkop кладёт в urltest_proxy_links для нативных urltest-секций.
 //
-//   shoulderkop links [--section=yt|eu|lte] [--json] [--grouped]
-//                     [--file=SUB] [--url=URL] [--mode=wifi|lte]
-//   shoulderkop links --podkop [--section=yt|eu|lte]
+//   shoulderkop links [--section=yt|eu] [--json] [--grouped]
+//                     [--file=SUB] [--url=URL]
+//   shoulderkop links --podkop [--section=yt|eu]
 
 function as_array(v) {
 	if (type(v) == "array")
@@ -1066,7 +1111,7 @@ function podkop_links(section) {
 function cmd_links(argv) {
 	let a = {
 		json: false, grouped: false, podkop: false, duplicates: false,
-		section: "", file: null, url: null, mode: null
+		section: "", file: null, url: null
 	};
 
 	for (let i = 1; i < length(argv); i++) {
@@ -1085,8 +1130,6 @@ function cmd_links(argv) {
 			a.file = substr(v, 7);
 		else if (substr(v, 0, 6) == "--url=")
 			a.url = substr(v, 6);
-		else if (substr(v, 0, 7) == "--mode=")
-			a.mode = substr(v, 7);
 	}
 
 	let rows = [];
@@ -1111,11 +1154,7 @@ function cmd_links(argv) {
 			return 1;
 		}
 
-		let mode = a.mode;
-		if (mode == null || mode == "")
-			mode = uci_get("shoulderkop", "settings", "mode");
-
-		for (let g in applymod.plan_sections(mode, nodes)) {
+		for (let g in applymod.plan_sections(nodes)) {
 			if (!links_section_match(g.name, a.section))
 				continue;
 			for (let n in g.nodes) {
@@ -1197,7 +1236,6 @@ function cmd_status() {
 		history_len: length(ds.history)
 	};
 
-	st.lists = listsmod.status();
 	st.self_update = selfupd.status();
 
 	print(sprintf("%J", st));
@@ -1258,33 +1296,6 @@ function cmd_selfupdate(argv) {
 	else
 		print(sprintf("%J", r) + "\n");
 	return (r.status == "error") ? 1 : 0;
-}
-
-// Ручное обновление кэша белых списков (LTE). --force игнорирует суточный TTL.
-function cmd_lists(argv) {
-	let force = false;
-	let as_json = false;
-	for (let i = 1; i < length(argv); i++) {
-		if (argv[i] == "--force")
-			force = true;
-		else if (argv[i] == "--json")
-			as_json = true;
-	}
-
-	let r = listsmod.sync(force);
-	if (as_json) {
-		print(sprintf("%J", r));
-		return r.ok ? 0 : 1;
-	}
-
-	if (r.skipped)
-		print("списки: кэш свежий, обновление не нужно\n");
-	else if (r.ok)
-		print("списки: ok (" + r.source + "), доменов " + r.domain_count +
-			", подсетей " + r.subnet_count + "\n");
-	else
-		print("списки: не обновлены — " + join("; ", r.errors || []) + "\n");
-	return r.ok ? 0 : 1;
 }
 
 // cron-выражение под выбранный интервал (минуты разнесены, чтобы не все роутеры
@@ -1415,7 +1426,12 @@ function cmd_diag(argv) {
 		return r.ok ? 0 : 1;
 	}
 
-	print("диагностика: " + (r.skipped ? "выключена" : (r.ok ? "ok" : "есть проблемы")) + "\n");
+	if (r.skipped) {
+		print("диагностика: пропущена" + ((r.reason != null) ? " (" + r.reason + ")" : "") + "\n");
+		return r.ok ? 0 : 1;
+	}
+
+	print("диагностика: " + (r.ok ? "ok" : "есть проблемы") + "\n");
 	for (let c in (r.checks || []))
 		print((c.ok ? "  [ok] " : "  [!]  ") + c.name + ": " + c.detail + "\n");
 	for (let a in (r.actions || []))
@@ -1445,11 +1461,9 @@ if (cmd == "convert") {
 	exit(cmd_schedule(ARGV[1] == "off"));
 } else if (cmd == "diag") {
 	exit(cmd_diag(ARGV));
-} else if (cmd == "lists") {
-	exit(cmd_lists(ARGV));
 } else if (cmd == "upgrade" || cmd == "selfupdate" || cmd == "self-update") {
 	exit(cmd_selfupdate(ARGV));
 } else {
-	print("usage: shoulderkop <convert|update|apply|list_servers|links|status|schedule|diag|lists|upgrade|self-update> [--rebuild] [--url=..] [--mode=lte|wifi] [--interval=1h] [--urltest=30s] [--schedule=0|1] [--yt-lists=youtube] [--eu-lists=russia_inside,telegram] [--section=yt|eu|lte] [--file=..] [--json] [--grouped] [--podkop] [--force] [--mirror=https://gh-proxy.com/] [off]");
+	print("usage: shoulderkop <convert|update|apply|list_servers|links|status|schedule|diag|upgrade|self-update> [--rebuild] [--url=..] [--interval=1h] [--urltest=30s] [--schedule=0|1] [--auto-update=0|1] [--yt-lists=youtube] [--eu-lists=russia_inside,telegram] [--section=yt|eu] [--file=..] [--json] [--grouped] [--podkop] [--force] [--mirror=https://gh-proxy.com/] [off]");
 	exit(2);
 }
