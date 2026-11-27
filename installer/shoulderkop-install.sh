@@ -38,7 +38,6 @@ DO_SK=1
 WANT_EXTENDED=1
 
 URL=""
-MODE=""
 INTERVAL=""
 URLTEST=""
 SCHEDULE=""
@@ -1452,7 +1451,7 @@ configure() {
 	[ "$_now_sb" = "$BEFORE_SB" ] || _same=0
 	_susp_now=$(uci -q get shoulderkop.settings.suspended 2>/dev/null)
 	if [ "$_same" -eq 1 ] && [ "$FORCE" -eq 0 ] && [ "$DRY" -eq 0 ] \
-	   && [ -z "$URL$MODE$INTERVAL$URLTEST$SCHEDULE" ] \
+	   && [ -z "$URL$INTERVAL$URLTEST$SCHEDULE" ] \
 	   && [ "$_susp_now" != "1" ] && sub_url_set; then
 		ok "всё актуально: shoulderkop ${_now_sk:-?}, podkop ${_now_pk:-?}, подписка задана"
 		ok "ничего не меняю — подписку и секции podkop не трогаю"
@@ -1466,12 +1465,6 @@ configure() {
 	fi
 
 	_uci_changed=0
-	if [ -n "$MODE" ]; then
-		uci -q set "shoulderkop.settings.mode=$MODE" && _uci_changed=1
-	fi
-	if [ -z "$(uci -q get shoulderkop.settings.mode)" ]; then
-		uci -q set "shoulderkop.settings.mode=wifi" && _uci_changed=1
-	fi
 	if [ -n "$INTERVAL" ]; then
 		uci -q set "shoulderkop.settings.update_interval=$INTERVAL" && _uci_changed=1
 	fi
@@ -1511,7 +1504,6 @@ configure() {
 		info "обрабатываю подписку — это может занять до минуты"
 		set -- /usr/bin/shoulderkop update
 		[ -n "$URL" ] && set -- "$@" "--url=$URL"
-		[ -n "$MODE" ] && set -- "$@" "--mode=$MODE"
 		[ -n "$INTERVAL" ] && set -- "$@" "--interval=$INTERVAL"
 		[ -n "$URLTEST" ] && set -- "$@" "--urltest=$URLTEST"
 		[ -n "$SCHEDULE" ] && set -- "$@" "--schedule=$SCHEDULE"
@@ -1605,7 +1597,7 @@ verify() {
 	fi
 
 	if [ -f /etc/config/shoulderkop ]; then
-		ok "режим: $(uci -q get shoulderkop.settings.mode) · urltest: $(uci -q get shoulderkop.settings.urltest_interval)"
+		ok "urltest: $(uci -q get shoulderkop.settings.urltest_interval) · обновление: $(uci -q get shoulderkop.settings.update_interval)"
 	else
 		warn "нет /etc/config/shoulderkop"
 	fi
@@ -1727,7 +1719,6 @@ $APP $VER — ставит shoulderkop, podkop и sing-box-extended.
   --url=URL              ссылка на подписку — обработать сразу, без вопроса
   -y, --yes              не задавать вопросы (extended ставится, подписка — из --url)
   --dry-run              показать план и выйти, ничего не меняя
-  --mode=lte|wifi        режим: lte — обход БС, wifi — домашний интернет (по умолчанию wifi)
   -h, --help             эта справка
 
 Для автоматизации:
@@ -1752,7 +1743,7 @@ $APP $VER — ставит shoulderkop, podkop и sing-box-extended.
   2. ставит podkop (и luci-app-podkop), убирая конфликтный https-dns-proxy;
   3. ставит sing-box-extended — если он нужен и есть место;
   4. ставит shoulderkop и luci-app-shoulderkop;
-  5. применяет режим, включает расписание и обрабатывает подписку;
+  5. включает расписание и обрабатывает подписку;
   6. показывает версии и состояние.
 
 Коды возврата: 0 — успех, 1 — ошибка, 2 — прервано.
@@ -1766,7 +1757,6 @@ parse_args() {
 			--dry-run) DRY=1; ASSUME_YES=1 ;;
 			--force) FORCE=1 ;;
 			--url=*) URL="${1#*=}" ;;
-			--mode=*) MODE="${1#*=}" ;;
 			--interval=*) INTERVAL="${1#*=}" ;;
 			--urltest=*) URLTEST="${1#*=}" ;;
 			--schedule=*) SCHEDULE="${1#*=}" ;;
@@ -1790,10 +1780,6 @@ parse_args() {
 		shift
 	done
 
-	case "$MODE" in
-		''|lte|wifi) ;;
-		*) err "неверный --mode=$MODE (lte или wifi)"; exit 1 ;;
-	esac
 	case "$SCHEDULE" in
 		''|0|1) ;;
 		*) err "неверный --schedule=$SCHEDULE (0 или 1)"; exit 1 ;;

@@ -7,14 +7,11 @@
 'require dom';
 
 // Shoulderkop v2 — одна страница, минимум настроек:
-//   ссылка подписки + режим (LTE / WiFi) → остальное пакет настраивает в podkop сам.
-//   Для WiFi — списки сообщества podkop (как в редакторе секции podkop); в LTE их нет.
+//   ссылка подписки + списки сообщества podkop (как в редакторе секции podkop).
+//   Режим один — «Домашний интернет»: выбора режима и LTE-ветки больше нет.
 //   «Обновить подписку» — сохранить настройки, скачать подписку и разложить секции.
-//   «Обновить конфигурацию» (появляется при смене режима) — то же самое, но с полной
-//   пересборкой секций podkop: старые удаляются, новые создаются с нуля.
-
-var MODE_LTE = 'lte';
-var MODE_WIFI = 'wifi';
+//   «Пересобрать секции» — то же, но с полной пересборкой секций podkop:
+//   старые skop_* удаляются, новые создаются с нуля.
 
 var SETTINGS = 'settings';
 
@@ -64,15 +61,16 @@ var ALLOWED_WITH_RUSSIA_INSIDE = [
 	'digitalocean', 'cloudfront'
 ];
 
-// Значения по умолчанию повторяют прежнее захардкоженное поведение:
-// skop_yt → youtube, skop_eu → russia_inside,telegram,meta,cloudflare,hodca,roblox.
+// Значения по умолчанию для опций формы: их же один раз сеет миграция в конфиг,
+// чтобы «пусто» означало «пусто» и для тех, кто уже обновился. В updateArgs()
+// дефолты не подставляются: что в форме, то и уходит в бэкенд.
 var WIFI_LIST_DEFAULTS = {
 	yt: [ 'youtube' ],
 	eu: [ 'russia_inside', 'telegram', 'meta', 'cloudflare', 'hodca', 'roblox' ]
 };
 
-// После «Сохранить и применить» пересобираем секции (мог смениться режим) и
-// переставляем cron: расписание живёт в /etc/crontabs/root, а не в UCI.
+// После «Сохранить и применить» применяем списки (uci-applied → shoulderkop apply)
+// и переставляем cron: расписание живёт в /etc/crontabs/root, а не в UCI.
 // Кнопки страницы этот хук не ждут — они ходят в бэкенд напрямую.
 var appliedHooked = false;
 
@@ -98,11 +96,7 @@ function errText(e) {
 	return '' + e;
 }
 
-function modeLabel(mode) {
-	return (mode === MODE_WIFI) ? _('Домашний интернет') : _('Обход БС');
-}
-
-// ---- списки сообщества (WiFi) ---------------------------------------------
+// ---- списки сообщества -----------------------------------------------------
 
 function listValues(o, section_id) {
 	var v = o.formvalue(section_id);
@@ -127,7 +121,6 @@ function communityListOption(s, name, title, description, defaults) {
 	o.placeholder = 'Service list';
 	o.rmempty = false;
 	o.default = defaults.slice();
-	o.depends('mode', MODE_WIFI);
 
 	DOMAIN_LIST_OPTIONS.forEach(function (p) {
 		o.value(p[0], _(p[1]));
@@ -136,8 +129,8 @@ function communityListOption(s, name, title, description, defaults) {
 	o.validate = function (section_id, value) {
 		var vals = Array.isArray(value) ? value
 			: ((value != null && value !== '') ? [ value ] : []);
-		// пусто = «как по умолчанию» (apply.uc сам подставит defaults),
-		// поэтому пустой список ошибкой не считаем
+		// пусто — допустимый выбор: «ничего не заворачивать»;
+		// дефолты за пользователя бэкенд не подставляет
 		for (var i = 0; i < vals.length; i++)
 			if (!DOMAIN_LIST_LABELS[vals[i]])
 				return _('Неизвестный список: ') + vals[i];
@@ -281,6 +274,38 @@ function listBlock(title, items) {
 		E('strong', {}, title),
 		E('ul', {}, items.map(function (x) { return E('li', {}, '' + x); }))
 	]);
+}
+
+// ---- состояние туннеля в отчёте -------------------------------------------
+//
+// tunnel_up и paused_clean приходят из podkopctl: «туннель поднят» и «после
+// паузы nft снят». restart_attempts показываем только когда podkop пришлось
+// перезапускать больше одного раза — это уже повод посмотреть журнал.
+
+function boolValue(v) {
+	if (v === true || v === '1' || v === 1)
+		return true;
+	if (v === false || v === '0' || v === 0)
+		return false;
+	return null;
+}
+
+function healthLines(r) {
+	r = r || {};
+	var out = [];
+	var tunnel = boolValue(r.tunnel_up);
+	var paused = boolValue(r.paused_clean);
+
+	if (tunnel != null)
+		out.push(E('p', {}, [ E('strong', {}, _('Туннель: ')), tunnel ? _('поднят') : _('не поднят') ]));
+
+	if (paused != null)
+		out.push(E('p', {}, [ E('strong', {}, _('Пауза: ')), paused ? _('nft снят') : _('nft не снят') ]));
+
+	if (Number(r.restart_attempts) > 1)
+		out.push(E('p', {}, [ E('strong', {}, _('Перезапусков podkop: ')), '' + r.restart_attempts ]));
+
+	return out;
 }
 
 // ---- несколько подписок ---------------------------------------------------
@@ -471,39 +496,23 @@ function updateArgs(ctx, rebuild) {
 	if (urls.length === 0)
 		return Promise.reject(new Error(_('Укажите ссылку подписки.')));
 
-	var mode = ctx.mode.formvalue(SETTINGS) || MODE_LTE;
-	var ytLists = [];
-	var euLists = [];
-
-	if (mode === MODE_WIFI) {
-		ytLists = listValues(ctx.ytLists, SETTINGS);
-		euLists = listValues(ctx.euLists, SETTINGS);
-
-		// пусто в форме = не трогали → берём те же дефолты, что и apply.uc
-		if (!ytLists.length)
-			ytLists = WIFI_LIST_DEFAULTS.yt.slice();
-		if (!euLists.length)
-			euLists = WIFI_LIST_DEFAULTS.eu.slice();
-	}
+	// Пустой список уходит пустым: что выбрано в форме, то и попадёт в podkop.
+	// Дефолты живут в конфиге (их один раз сеет миграция), а не на клиенте.
+	var ytLists = listValues(ctx.ytLists, SETTINGS);
+	var euLists = listValues(ctx.euLists, SETTINGS);
 
 	var args = [ 'update' ];
 	if (rebuild)
 		args.push('--rebuild');
 	urls.forEach(function (u) { args.push('--url=' + ('' + u).trim()); });
 
-	args.push('--mode=' + mode);
 	args.push('--interval=' + (ctx.interval.formvalue(SETTINGS) || '30m'));
 	args.push('--urltest=' + (ctx.urltest.formvalue(SETTINGS) || '30s'));
 	args.push('--schedule=' + flagValue(ctx.sched.formvalue(SETTINGS)));
 	if (ctx.autoUpdate)
 		args.push('--auto-update=' + flagValue(ctx.autoUpdate.formvalue(SETTINGS)));
-
-	// Свои списки сообщества передаём только для WiFi: в LTE секции свои,
-	// а сохранённые значения не трогаем, чтобы они пережили переключение режима.
-	if (mode === MODE_WIFI) {
-		args.push('--yt-lists=' + ytLists.join(','));
-		args.push('--eu-lists=' + euLists.join(','));
-	}
+	args.push('--yt-lists=' + ytLists.join(','));
+	args.push('--eu-lists=' + euLists.join(','));
 
 	return Promise.resolve(args);
 }
@@ -513,9 +522,6 @@ function updateArgs(ctx, rebuild) {
 function appliedLine(a) {
 	if (a.error)
 		return E('li', {}, (a.section || '?') + ': ' + _('ошибка: ') + a.error);
-	if (a.kind === 'exclusion')
-		return E('li', {}, a.section + ': ' + _('списки → напрямую') + ' (' + (a.lists || 0) + ')' +
-			(a.source === 'http' ? ' · ' + _('локально') : ''));
 	if (a.mode === 'group')
 		return E('li', {}, a.section + ': ' + _('группа из ') + (a.children ? a.children.length : 0) + _(' серверов'));
 	if (a.mode === 'urltest')
@@ -534,8 +540,15 @@ function reportNodes(r) {
 	var errors = r.errors || [];
 	var ui = r.userinfo || null;
 
+	if (status === 'busy') {
+		out.push(noteBox('warning', _('Идёт другой запуск shoulderkop (обновление уже выполняется). Попробуйте через минуту.')));
+		return out;
+	}
+
 	if (status === 'expired') {
-		out.push(noteBox('warning', _('Подписка неактивна (истекла). Podkop и sing-box остановлены, автозапуск выключен. Планировщик продолжает проверять подписку: как только панель отдаст серверы, туннель запустится автоматически.')));
+		out.push(noteBox('warning', _('Подписка неактивна (истекла). Podkop и sing-box остановлены, автозапуск выключен, nft-таблица снята. Планировщик продолжает проверять подписку: как только панель отдаст серверы, туннель запустится автоматически.')));
+
+		healthLines(r).forEach(function (n) { out.push(n); });
 
 		var et = expireText(ui);
 		if (et)
@@ -564,6 +577,7 @@ function reportNodes(r) {
 
 	if (status === 'error') {
 		out.push(noteBox('warning', _('Не удалось проверить подписку — podkop оставлен как есть, туннель не трогали.')));
+		healthLines(r).forEach(function (n) { out.push(n); });
 		var lk2 = linksBlock(r.checked);
 		if (lk2)
 			out.push(lk2);
@@ -577,10 +591,10 @@ function reportNodes(r) {
 	}
 
 	out.push(E('p', {}, [
-		E('strong', {}, _('Режим: ')), r.mode ? modeLabel(r.mode) : '—',
-		E('br'),
 		E('strong', {}, _('Серверов: ')), '' + (r.count || 0)
 	]));
+
+	healthLines(r).forEach(function (n) { out.push(n); });
 
 	var et2 = expireText(ui, true);
 	if (et2)
@@ -625,10 +639,10 @@ function reportNodes(r) {
 	return out;
 }
 
-// Сохранить настройки и обновить конфигурацию.
+// Сохранить настройки и обновить секции.
 // rebuild = true — сначала удалить все секции skop_* из podkop и создать заново.
 function doUpdate(ctx, rebuild) {
-	var title = rebuild ? _('Обновить конфигурацию') : _('Обновить подписку');
+	var title = rebuild ? _('Пересобрать секции') : _('Обновить подписку');
 
 	ui.showModal(title, [ E('p', { class: 'spinning' }, _('Применяю настройки…')) ]);
 
@@ -665,6 +679,9 @@ function doUpdate(ctx, rebuild) {
 // ---- состояние ------------------------------------------------------------
 
 function statusNodes(st) {
+	if (st != null && st.status === 'busy')
+		return [ noteBox('warning', _('Идёт другой запуск shoulderkop. Попробуйте через минуту.')) ];
+
 	if (st == null || (st.updated == null && !st.suspended && st.status !== 'error'))
 		return [ E('em', {}, _('Данных пока нет — нажмите «Обновить подписку».')) ];
 
@@ -681,7 +698,7 @@ function statusNodes(st) {
 			out.push(noteBox('warning', _('Туннель на паузе. Последняя проверка подписки не удалась (сеть или панель) — пауза сохраняется, следующая попытка по расписанию.')));
 		}
 		else {
-			out.push(noteBox('warning', _('Подписка неактивна (истекла). Podkop и sing-box остановлены, автозапуск выключен. Планировщик продолжает проверять подписку и запустит туннель, когда панель отдаст серверы.')));
+			out.push(noteBox('warning', _('Подписка неактивна (истекла). Podkop и sing-box остановлены, автозапуск выключен, nft-таблица снята. Планировщик продолжает проверять подписку и запустит туннель, когда панель отдаст серверы.')));
 		}
 		if (st.suspended_at)
 			out.push(E('p', {}, [ E('strong', {}, _('Пауза с: ')), fmtDate(st.suspended_at) ]));
@@ -689,6 +706,8 @@ function statusNodes(st) {
 	else if (st.status === 'error') {
 		out.push(noteBox('warning', _('Последняя проверка не удалась — podkop оставлен как есть, туннель не трогали.')));
 	}
+
+	healthLines(st).forEach(function (n) { out.push(n); });
 
 	var et = expireText(ui, st.status === 'active');
 	if (et)
@@ -700,23 +719,13 @@ function statusNodes(st) {
 	out.push(E('p', {}, [
 		E('strong', {}, _('Серверов: ')), '' + (st.count || 0),
 		E('br'),
-		E('strong', {}, _('Последняя проверка: ')), st.updated ? fmtDate(st.updated) : '—',
-		E('br'),
-		E('strong', {}, _('Режим: ')), st.mode ? modeLabel(st.mode) : '—'
+		E('strong', {}, _('Последняя проверка: ')), st.updated ? fmtDate(st.updated) : '—'
 	]));
 
 	if (st.services) {
 		var svc = serviceText(st.services);
 		if (svc)
 			out.push(E('p', {}, [ E('strong', {}, _('Сервисы: ')), svc ]));
-	}
-
-	if (st.lists && (st.lists.domain_count || st.lists.subnet_count)) {
-		var lst = _('Белые списки: ') + (st.lists.domain_count || 0) + ' ' + _('доменов') + ', ' +
-			(st.lists.subnet_count || 0) + ' ' + _('подсетей');
-		if (st.lists.http_domain)
-			lst += ' · ' + _('локально');
-		out.push(E('p', {}, lst));
 	}
 
 	if (st.self_update) {
@@ -776,49 +785,10 @@ return view.extend({
 
 	render: function () {
 		var map = new form.Map('shoulderkop', _('Shoulderkop'),
-			_('Вставьте ссылку подписки и выберите режим — секции Podkop настроятся сами.'));
-
-		var savedMode = uci.get('shoulderkop', SETTINGS, 'mode') || MODE_LTE;
+			_('Вставьте ссылку подписки — секции Podkop настроятся сами.'));
 
 		// контекст для сохранения формы: ссылки на виджеты
 		var ctx = {};
-
-		// строка с кнопкой «Обновить конфигурацию», появляется при смене режима
-		var hintEl = E('div', {});
-
-		// прятать нужно всю строку .cbi-value: у пустой ячейки остаётся margin-bottom
-		function hintRow() {
-			var n = hintEl.parentNode;
-			while (n != null && n.nodeType === 1) {
-				if (n.classList && n.classList.contains('cbi-value'))
-					return n;
-				n = n.parentNode;
-			}
-			return null;
-		}
-
-		function showHint(on) {
-			var row = hintRow();
-			if (row)
-				row.style.display = on ? '' : 'none';
-		}
-
-		function spawnHint(value) {
-			if (value === savedMode) {
-				dom.content(hintEl, []);
-				showHint(false);
-				return;
-			}
-			dom.content(hintEl, [
-				E('p', { style: 'margin:0 0 6px 0' },
-					_('Режим изменён на «') + modeLabel(value) + _('». Нажмите «Обновить конфигурацию» — секции Podkop будут собраны заново.')),
-				E('button', {
-					class: 'cbi-button cbi-button-action',
-					click: function () { doUpdate(ctx, true); }
-				}, _('Обновить конфигурацию'))
-			]);
-			showHint(true);
-		}
 
 		// без заголовка секции: у NamedSection h3 не рисуется при title = null
 		var s = map.section(form.NamedSection, SETTINGS, 'settings', null);
@@ -837,7 +807,7 @@ return view.extend({
 					'.'
 				]),
 				E('p', { style: 'margin:0 0 6px 0' },
-					_('Если подписка истекла, podkop и sing-box останавливаются, их автозапуск выключается, а планировщик продолжает проверять подписку. Когда в ней снова появятся серверы, всё запустится автоматически. Для этого должно быть включено «Обновлять по расписанию».')),
+					_('Если подписка истекла, podkop и sing-box останавливаются, их автозапуск выключается, nft-таблица снимается, а планировщик продолжает проверять подписку. Когда в ней снова появятся серверы, всё запустится автоматически. Для этого должно быть включено «Обновлять по расписанию».')),
 				E('p', { style: 'margin:0' },
 					_('Требуется podkop > 0.7.24, а для серверов xhttp — sing-box > 1.14.1-extended-2.7.2.'))
 			]);
@@ -849,30 +819,8 @@ return view.extend({
 		o.rmempty = false;
 		ctx.url = o;
 
-		o = s.option(form.ListValue, 'mode', _('Режим'));
-		o.value(MODE_LTE, _('Обход БС'));
-		o.value(MODE_WIFI, _('Домашний интернет'));
-		o.default = MODE_WIFI;
-		o.rmempty = false;
-		o.onchange = function (ev, section_id, value) {
-			spawnHint(value);
-		};
-		ctx.mode = o;
-
-		// пояснение к режимам отдельной строкой: в description перенос не сделать,
-		// там строка рендерится текстовым узлом и \n схлопывается
-		o = s.option(form.DummyValue, '_modehelp', '\u00a0');
-		o.rawhtml = true;
-		o.cfgvalue = function () {
-			return E('div', { class: 'cbi-value-description', style: 'max-width:60em' }, [
-				E('div', {}, _('«Обход БС» — весь трафик через туннель, кроме белого списка РКН (белые списки — напрямую).')),
-				E('div', {}, _('«Домашний интернет» — трафик по умолчанию напрямую, заблокированные сервисы через туннель.'))
-			]);
-		};
-
-		// Списки сообщества podkop для WiFi-секций. Пока значения не меняли,
-		// действуют прежние захардкоженные: youtube и russia_inside+telegram+…
-		// В LTE поля скрыты и на раскладку не влияют.
+		// Списки сообщества — настоящий редактор секций: что выбрано, то и лежит
+		// в podkop; пусто — секция ничего не заворачивает.
 		o = communityListOption(s, 'wifi_yt_lists',
 			_('Списки сообщества — YouTube'),
 			_('Что направлять через серверы YouTube (секция skop_yt).'),
@@ -881,13 +829,12 @@ return view.extend({
 
 		o = communityListOption(s, 'wifi_eu_lists',
 			_('Списки сообщества — остальные сервисы'),
-			_('Что направлять через остальные WiFi-серверы (секция skop_eu).'),
+			_('Что направлять через остальные серверы (секция skop_eu).'),
 			WIFI_LIST_DEFAULTS.eu);
 		ctx.euLists = o;
 
 		o = s.option(form.DummyValue, '_listshelp', '\u00a0');
 		o.rawhtml = true;
-		o.depends('mode', MODE_WIFI);
 		o.cfgvalue = function () {
 			return E('div', { class: 'cbi-value-description', style: 'max-width:60em' }, [
 				E('div', {}, [
@@ -899,17 +846,9 @@ return view.extend({
 					}, 'github.com/itdoginfo/allow-domains'),
 					_('. Russia inside уже включает YouTube, Geo Block и другие списки — отдельно их добавлять не нужно.')
 				]),
-				E('div', {}, _('По умолчанию: YouTube — youtube; остальные сервисы — russia_inside, telegram, meta, cloudflare, hodca, roblox.')),
-				E('div', {}, _('Изменения применяются кнопкой «Обновить подписку» или «Сохранить и применить».'))
+				E('div', {}, _('Пусто — не заворачивать ничего. По умолчанию: YouTube — youtube; остальные сервисы — russia_inside, telegram, meta, cloudflare, hodca, roblox.')),
+				E('div', {}, _('Изменения применяются кнопками «Обновить подписку» / «Пересобрать секции» или «Сохранить и применить».'))
 			]);
-		};
-
-		// title = nbsp (не null и не пустая строка) — иначе LuCI не резервирует колонку
-		// подписи и блок уезжает влево, под названия пунктов.
-		o = s.option(form.DummyValue, '_modehint', '\u00a0');
-		o.rawhtml = true;
-		o.cfgvalue = function () {
-			return hintEl;
 		};
 
 		// как часто sing-box в группе проверяет серверы и выбирает лучший
@@ -932,6 +871,11 @@ return view.extend({
 					class: 'cbi-button cbi-button-action',
 					click: function () { doUpdate(ctx, false); }
 				}, _('Обновить подписку')),
+				' ',
+				E('button', {
+					class: 'cbi-button cbi-button-action',
+					click: function () { doUpdate(ctx, true); }
+				}, _('Пересобрать секции')),
 				' ',
 				E('a', { class: 'cbi-button', href: L.url('admin/services/podkop') }, _('Открыть podkop'))
 			]);
@@ -989,11 +933,6 @@ return view.extend({
 
 		hookAfterApply();
 
-		return map.render().then(function (node) {
-			// прячем пустую строку и сразу, и после вставки в документ
-			showHint(false);
-			window.setTimeout(function () { showHint(false); }, 0);
-			return node;
-		});
+		return map.render();
 	}
 });
